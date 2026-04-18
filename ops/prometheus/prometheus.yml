@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: cache-next
+    static_configs:
+      - targets: ["cache-us:4000"]
+        labels:
+          region: us-east
+      - targets: ["cache-eu:4000"]
+        labels:
+          region: eu-west
+      - targets: ["cache-ap:4000"]
+        labels:
+          region: ap-south
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]

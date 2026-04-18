@@ -1,0 +1,7 @@
+_build
+deps
+.git
+.github
+test
+tmp
+docker-compose.override.yml

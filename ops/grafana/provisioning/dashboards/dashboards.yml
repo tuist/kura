@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: cache-next
+    orgId: 1
+    folder: Cache Next
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/dashboards
