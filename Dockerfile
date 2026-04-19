@@ -29,8 +29,8 @@ ENV RUST_LOG=info
 
 WORKDIR /app
 
-COPY --from=build /app/target/release/cache-next /usr/local/bin/cache-next
+COPY --from=build /app/target/release/cache /usr/local/bin/cache
 
 EXPOSE 4000
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cache-next"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cache"]

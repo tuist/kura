@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 
 setup_file() {
-  export COMPOSE_PROJECT_NAME="cache-next-handoff"
+  export COMPOSE_PROJECT_NAME="cache-handoff"
   export CACHE_US_PORT=4301
   export CACHE_EU_PORT=4302
   export CACHE_AP_PORT=4303

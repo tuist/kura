@@ -125,7 +125,7 @@ async fn main() {
         .with_state(state.clone());
 
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.port));
-    info!("cache-next Rust service listening on {address}");
+    info!("cache Rust service listening on {address}");
 
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -198,10 +198,10 @@ impl Config {
         let region = std::env::var("CACHE_REGION").unwrap_or_else(|_| "local".into());
         let tmp_dir = std::env::var("CACHE_TMP_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("tmp/cache-next"));
+            .unwrap_or_else(|_| PathBuf::from("tmp/cache"));
         let data_dir = std::env::var("CACHE_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("tmp/cache-next-data"));
+            .unwrap_or_else(|_| PathBuf::from("tmp/cache-data"));
         let node_url =
             std::env::var("CACHE_NODE_URL").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
         let peers = std::env::var("CACHE_PEERS")
@@ -255,13 +255,13 @@ fn init_tracing(config: &Config) -> Option<SdkTracerProvider> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "cache_next=info".into());
+        .unwrap_or_else(|_| "cache=info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     match config.otlp_traces_endpoint.as_deref() {
         Some(endpoint) => match build_tracer_provider(config, endpoint) {
             Ok(tracer_provider) => {
-                let tracer = tracer_provider.tracer("cache-next");
+                let tracer = tracer_provider.tracer("cache");
                 tracing_subscriber::registry()
                     .with(env_filter)
                     .with(fmt_layer)
@@ -300,7 +300,7 @@ fn build_tracer_provider(config: &Config, endpoint: &str) -> Result<SdkTracerPro
     let resource = Resource::builder_empty()
         .with_attributes([
             KeyValue::new("service.name", config.otel_service_name.clone()),
-            KeyValue::new("service.namespace", "cache-next"),
+            KeyValue::new("service.namespace", "cache"),
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             KeyValue::new(
                 "deployment.environment.name",
@@ -860,57 +860,57 @@ impl Metrics {
         let node_info = Family::<NodeInfoLabels, Gauge>::default();
 
         registry.register(
-            "cache_next_http_requests_total",
+            "cache_http_requests_total",
             "HTTP requests by route and status code",
             http_requests.clone(),
         );
         registry.register(
-            "cache_next_http_request_duration_seconds",
+            "cache_http_request_duration_seconds",
             "HTTP request latency by route",
             http_request_duration.clone(),
         );
         registry.register(
-            "cache_next_http_exceptions_total",
+            "cache_http_exceptions_total",
             "HTTP exceptions by route and class",
             http_exceptions.clone(),
         );
         registry.register(
-            "cache_next_artifact_reads_total",
+            "cache_artifact_reads_total",
             "Artifact reads by kind and result",
             artifact_reads.clone(),
         );
         registry.register(
-            "cache_next_artifact_writes_total",
+            "cache_artifact_writes_total",
             "Artifact writes by kind and result",
             artifact_writes.clone(),
         );
         registry.register(
-            "cache_next_artifact_read_bytes_total",
+            "cache_artifact_read_bytes_total",
             "Artifact read throughput by kind and result",
             artifact_read_bytes.clone(),
         );
         registry.register(
-            "cache_next_artifact_write_bytes_total",
+            "cache_artifact_write_bytes_total",
             "Artifact write throughput by kind and result",
             artifact_write_bytes.clone(),
         );
         registry.register(
-            "cache_next_replication_requests_total",
+            "cache_replication_requests_total",
             "Peer replication requests by target, operation, and result",
             replication_requests.clone(),
         );
         registry.register(
-            "cache_next_replication_request_duration_seconds",
+            "cache_replication_request_duration_seconds",
             "Peer replication request latency by target and operation",
             replication_request_duration.clone(),
         );
         registry.register(
-            "cache_next_multipart_parts_total",
+            "cache_multipart_parts_total",
             "Multipart part uploads by result",
             multipart_parts.clone(),
         );
         registry.register(
-            "cache_next_node_info",
+            "cache_node_info",
             "Node info labels for each cache region",
             node_info.clone(),
         );

@@ -4,15 +4,15 @@ services:
       context: .
       dockerfile: Dockerfile
     hostname: cache-us
-    domainname: cache-next.internal
+    domainname: cache.internal
     environment: &cache_env
       PORT: "4000"
       TENANT_ID: demo-tenant
-      CACHE_TMP_DIR: /tmp/cache-next
-      CACHE_DATA_DIR: /var/cache/cache-next
+      CACHE_TMP_DIR: /tmp/cache
+      CACHE_DATA_DIR: /var/cache/cache
       CACHE_REGION: us-east
-      CACHE_NODE_URL: http://cache-us.cache-next.internal:4000
-      CACHE_PEERS: http://cache-us.cache-next.internal:4000,http://cache-eu.cache-next.internal:4000,http://cache-ap.cache-next.internal:4000
+      CACHE_NODE_URL: http://cache-us.cache.internal:4000
+      CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
       OTEL_SERVICE_NAME: cache-us
       OTEL_DEPLOYMENT_ENVIRONMENT: local
@@ -27,23 +27,23 @@ services:
     ports:
       - "${CACHE_US_PORT:-4101}:4000"
     volumes:
-      - cache-us-data:/var/cache/cache-next
+      - cache-us-data:/var/cache/cache
     networks:
       default:
         aliases:
-          - cache-us.cache-next.internal
+          - cache-us.cache.internal
 
   cache-eu:
     build:
       context: .
       dockerfile: Dockerfile
     hostname: cache-eu
-    domainname: cache-next.internal
+    domainname: cache.internal
     environment:
       <<: *cache_env
       CACHE_REGION: eu-west
-      CACHE_NODE_URL: http://cache-eu.cache-next.internal:4000
-      CACHE_PEERS: http://cache-us.cache-next.internal:4000,http://cache-eu.cache-next.internal:4000,http://cache-ap.cache-next.internal:4000
+      CACHE_NODE_URL: http://cache-eu.cache.internal:4000
+      CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
       OTEL_SERVICE_NAME: cache-eu
     depends_on:
       cache-us:
@@ -59,23 +59,23 @@ services:
     ports:
       - "${CACHE_EU_PORT:-4102}:4000"
     volumes:
-      - cache-eu-data:/var/cache/cache-next
+      - cache-eu-data:/var/cache/cache
     networks:
       default:
         aliases:
-          - cache-eu.cache-next.internal
+          - cache-eu.cache.internal
 
   cache-ap:
     build:
       context: .
       dockerfile: Dockerfile
     hostname: cache-ap
-    domainname: cache-next.internal
+    domainname: cache.internal
     environment:
       <<: *cache_env
       CACHE_REGION: ap-south
-      CACHE_NODE_URL: http://cache-ap.cache-next.internal:4000
-      CACHE_PEERS: http://cache-us.cache-next.internal:4000,http://cache-eu.cache-next.internal:4000,http://cache-ap.cache-next.internal:4000
+      CACHE_NODE_URL: http://cache-ap.cache.internal:4000
+      CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
       OTEL_SERVICE_NAME: cache-ap
     depends_on:
       cache-eu:
@@ -91,11 +91,11 @@ services:
     ports:
       - "${CACHE_AP_PORT:-4103}:4000"
     volumes:
-      - cache-ap-data:/var/cache/cache-next
+      - cache-ap-data:/var/cache/cache
     networks:
       default:
         aliases:
-          - cache-ap.cache-next.internal
+          - cache-ap.cache.internal
 
   prometheus:
     image: prom/prometheus:v3.11.2

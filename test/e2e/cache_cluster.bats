@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 
 setup_file() {
-  export COMPOSE_PROJECT_NAME="cache-next-e2e"
+  export COMPOSE_PROJECT_NAME="cache-e2e"
   export CACHE_US_PORT=4201
   export CACHE_EU_PORT=4202
   export CACHE_AP_PORT=4203
@@ -188,7 +188,7 @@ status_only() {
   [[ "$output" == *'"database":"ok"'* ]]
 
   run wait_for_contains \
-    "${PROMETHEUS_URL}/api/v1/query?query=cache_next_node_info" \
+    "${PROMETHEUS_URL}/api/v1/query?query=cache_node_info" \
     "us-east"
   [ "$status" -eq 0 ]
   [[ "$output" == *"us-east"* ]]
@@ -197,5 +197,5 @@ status_only() {
 
   run curl -fsS "${CACHE_US_URL}/metrics"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"cache_next_http_requests_total"* ]]
+  [[ "$output" == *"cache_http_requests_total"* ]]
 }

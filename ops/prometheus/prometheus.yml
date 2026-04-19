@@ -3,7 +3,7 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: cache-next
+  - job_name: cache
     static_configs:
       - targets: ["cache-us:4000"]
         labels:

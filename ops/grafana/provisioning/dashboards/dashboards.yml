@@ -1,9 +1,9 @@
 apiVersion: 1
 
 providers:
-  - name: cache-next
+  - name: cache
     orgId: 1
-    folder: Cache Next
+    folder: cache
     type: file
     disableDeletion: false
     editable: true
