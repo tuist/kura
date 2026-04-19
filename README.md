@@ -1,6 +1,6 @@
-# Cache Next 🚀
+# cache
 
-`cache-next` is a Rust cache node for Tuist and Bazel action + binary cache traffic.
+`cache` is a Rust cache node for Tuist and Bazel action + binary cache traffic.
 
 ## Summary ✨
 
@@ -9,7 +9,6 @@
 - 🔁 Blobs and cache metadata replicate to peer nodes with eventual consistency
 - 📦 The HTTP API covers key value entries, Xcode CAS artifacts, Gradle artifacts, multipart module uploads, and project clean
 - 📊 The local stack includes Grafana, Prometheus, Loki, Promtail, and Tempo traces
-- 🚫 Swift registry APIs are intentionally skipped in this runtime
 
 ## Local stack 🧪
 
