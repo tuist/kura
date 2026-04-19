@@ -71,14 +71,14 @@ pub fn temp_file_path(directory: &Path, prefix: &str) -> PathBuf {
 
 pub fn artifact_storage_id(
     kind: ArtifactKind,
-    tenant: &str,
+    account: &str,
     project_handle: &str,
     key: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(kind.as_str().as_bytes());
     hasher.update([0]);
-    hasher.update(tenant.as_bytes());
+    hasher.update(account.as_bytes());
     hasher.update([0]);
     hasher.update(project_handle.as_bytes());
     hasher.update([0]);
@@ -140,9 +140,9 @@ mod tests {
 
     #[test]
     fn artifact_ids_are_stable() {
-        let a = artifact_storage_id(ArtifactKind::Xcode, "tenant", "ios", "abc");
-        let b = artifact_storage_id(ArtifactKind::Xcode, "tenant", "ios", "abc");
-        let c = artifact_storage_id(ArtifactKind::Gradle, "tenant", "ios", "abc");
+        let a = artifact_storage_id(ArtifactKind::Xcode, "account", "ios", "abc");
+        let b = artifact_storage_id(ArtifactKind::Xcode, "account", "ios", "abc");
+        let c = artifact_storage_id(ArtifactKind::Gradle, "account", "ios", "abc");
 
         assert_eq!(a, b);
         assert_ne!(a, c);

@@ -5,7 +5,7 @@ use tokio::fs;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
-    pub tenant: String,
+    pub account: String,
     pub region: String,
     pub tmp_dir: PathBuf,
     pub data_dir: PathBuf,
@@ -28,7 +28,7 @@ impl Config {
         let port = lookup("PORT")
             .and_then(|value| value.parse().ok())
             .unwrap_or(4000);
-        let tenant = lookup("TENANT_ID").unwrap_or_else(|| "demo-tenant".into());
+        let account = lookup("ACCOUNT_ID").unwrap_or_else(|| "demo-account".into());
         let region = lookup("CACHE_REGION").unwrap_or_else(|| "local".into());
         let tmp_dir = lookup("CACHE_TMP_DIR")
             .map(PathBuf::from)
@@ -59,7 +59,7 @@ impl Config {
 
         Self {
             port,
-            tenant,
+            account,
             region,
             tmp_dir,
             data_dir,
@@ -100,7 +100,7 @@ mod tests {
         let config = Config::from_lookup(|_| None);
 
         assert_eq!(config.port, 4000);
-        assert_eq!(config.tenant, "demo-tenant");
+        assert_eq!(config.account, "demo-account");
         assert_eq!(config.region, "local");
         assert_eq!(config.tmp_dir, PathBuf::from("tmp/cache"));
         assert_eq!(config.data_dir, PathBuf::from("tmp/cache-data"));
@@ -115,7 +115,7 @@ mod tests {
     fn from_lookup_parses_overrides() {
         let config = config_from(&[
             ("PORT", "4500"),
-            ("TENANT_ID", "acme"),
+            ("ACCOUNT_ID", "acme"),
             ("CACHE_REGION", "eu_west"),
             ("CACHE_TMP_DIR", "/tmp/cache"),
             ("CACHE_DATA_DIR", "/tmp/cache-data"),
@@ -130,7 +130,7 @@ mod tests {
         ]);
 
         assert_eq!(config.port, 4500);
-        assert_eq!(config.tenant, "acme");
+        assert_eq!(config.account, "acme");
         assert_eq!(config.region, "eu_west");
         assert_eq!(config.tmp_dir, PathBuf::from("/tmp/cache"));
         assert_eq!(config.data_dir, PathBuf::from("/tmp/cache-data"));

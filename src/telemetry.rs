@@ -74,7 +74,7 @@ fn build_tracer_provider(config: &Config, endpoint: &str) -> Result<SdkTracerPro
                 config.otel_deployment_environment.clone(),
             ),
             KeyValue::new("cache.region", config.region.clone()),
-            KeyValue::new("cache.tenant", config.tenant.clone()),
+            KeyValue::new("cache.account", config.account.clone()),
             KeyValue::new("service.instance.id", config.node_url.clone()),
         ])
         .build();

@@ -204,7 +204,7 @@ async fn up(State(state): State<SharedState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "ok",
-        "tenant": state.config.tenant,
+        "account": state.config.account,
         "region": state.config.region,
         "node": state.config.region,
         "connected_nodes": all_members.iter().cloned().filter(|region| region != &state.config.region).collect::<Vec<_>>(),
@@ -582,7 +582,7 @@ async fn clean_project(
 async fn internal_status(State(state): State<SharedState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "region": state.config.region,
-        "tenant": state.config.tenant,
+        "account": state.config.account,
     }))
 }
 

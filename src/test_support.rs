@@ -33,7 +33,7 @@ where
 
     let config = Arc::new(config);
     let store = Arc::new(Store::open(config.clone()).expect("failed to open test store"));
-    let metrics = Arc::new(Metrics::new(config.region.clone(), config.tenant.clone()));
+    let metrics = Arc::new(Metrics::new(config.region.clone(), config.account.clone()));
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

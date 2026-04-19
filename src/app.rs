@@ -29,7 +29,7 @@ pub async fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to create directories: {error}"))?;
 
     let store = Arc::new(Store::open(config.clone())?);
-    let metrics = Arc::new(Metrics::new(config.region.clone(), config.tenant.clone()));
+    let metrics = Arc::new(Metrics::new(config.region.clone(), config.account.clone()));
     let members = Arc::new(RwLock::new(BTreeSet::new()));
     let client = Client::builder()
         .timeout(Duration::from_secs(30))

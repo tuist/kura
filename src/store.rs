@@ -58,7 +58,7 @@ impl Store {
         project_handle: &str,
         key: &str,
     ) -> Result<bool, String> {
-        let artifact_id = artifact_storage_id(kind, &self.config.tenant, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.config.account, project_handle, key);
         match self.manifest(&artifact_id)? {
             Some(manifest) => Ok(Path::new(&manifest.blob_path).exists()),
             None => Ok(false),
@@ -84,7 +84,7 @@ impl Store {
         project_handle: &str,
         key: &str,
     ) -> Result<Option<ArtifactManifest>, String> {
-        let artifact_id = artifact_storage_id(kind, &self.config.tenant, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.config.account, project_handle, key);
         match self.manifest(&artifact_id)? {
             Some(manifest) if Path::new(&manifest.blob_path).exists() => Ok(Some(manifest)),
             Some(_) => Ok(None),
@@ -100,7 +100,7 @@ impl Store {
         content_type: &str,
         source_path: &Path,
     ) -> Result<ArtifactManifest, String> {
-        let artifact_id = artifact_storage_id(kind, &self.config.tenant, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.config.account, project_handle, key);
         let destination = blob_path(&self.config.data_dir, kind, &artifact_id);
         let parent = destination
             .parent()

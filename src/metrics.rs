@@ -34,7 +34,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(region: String, tenant: String) -> Self {
+    pub fn new(region: String, account: String) -> Self {
         let mut registry = Registry::default();
 
         let http_requests = Family::<HttpRequestLabels, Counter>::default();
@@ -128,7 +128,7 @@ impl Metrics {
 
         metrics
             .node_info
-            .get_or_create(&NodeInfoLabels { region, tenant })
+            .get_or_create(&NodeInfoLabels { region, account })
             .set(1);
 
         metrics
@@ -273,7 +273,7 @@ struct MultipartLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct NodeInfoLabels {
     region: String,
-    tenant: String,
+    account: String,
 }
 
 #[cfg(test)]
@@ -315,6 +315,6 @@ mod tests {
         assert!(rendered.contains("cache_multipart_parts_total"));
         assert!(rendered.contains("cache_node_info"));
         assert!(rendered.contains("region=\"eu-west\""));
-        assert!(rendered.contains("tenant=\"acme\""));
+        assert!(rendered.contains("account=\"acme\""));
     }
 }

@@ -7,7 +7,7 @@ services:
     domainname: cache.internal
     environment: &cache_env
       PORT: "4000"
-      TENANT_ID: demo-tenant
+      ACCOUNT_ID: demo-account
       CACHE_TMP_DIR: /tmp/cache
       CACHE_DATA_DIR: /var/cache/cache
       CACHE_REGION: us-east
@@ -23,7 +23,7 @@ services:
       retries: 18
     labels:
       cache.region: us-east
-      cache.tenant: demo-tenant
+      cache.account: demo-account
     ports:
       - "${CACHE_US_PORT:-4101}:4000"
     volumes:
@@ -55,7 +55,7 @@ services:
       retries: 18
     labels:
       cache.region: eu-west
-      cache.tenant: demo-tenant
+      cache.account: demo-account
     ports:
       - "${CACHE_EU_PORT:-4102}:4000"
     volumes:
@@ -87,7 +87,7 @@ services:
       retries: 18
     labels:
       cache.region: ap-south
-      cache.tenant: demo-tenant
+      cache.account: demo-account
     ports:
       - "${CACHE_AP_PORT:-4103}:4000"
     volumes:

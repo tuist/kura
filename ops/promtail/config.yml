@@ -26,5 +26,5 @@ scrape_configs:
         target_label: container
       - source_labels: [__meta_docker_container_label_cache_region]
         target_label: region
-      - source_labels: [__meta_docker_container_label_cache_tenant]
-        target_label: tenant
+      - source_labels: [__meta_docker_container_label_cache_account]
+        target_label: account
