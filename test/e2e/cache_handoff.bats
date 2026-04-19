@@ -7,8 +7,6 @@ setup_file() {
   export CACHE_AP_PORT=4303
   export TEMPO_PORT=3302
   export OTLP_PORT=4419
-  export RIAK_HTTP_PORT=8298
-  export RIAK_PB_PORT=8287
   export CACHE_US_URL="http://localhost:${CACHE_US_PORT}"
   export CACHE_EU_URL="http://localhost:${CACHE_EU_PORT}"
   export CACHE_AP_URL="http://localhost:${CACHE_AP_PORT}"
@@ -64,7 +62,7 @@ status_only() {
   curl -sS -o /dev/null -w "%{http_code}" "$@"
 }
 
-@test "ownership handoff moves singleton data to joined nodes" {
+@test "outbox replication moves singleton data to joined nodes" {
   run status_only -X PUT \
     "${CACHE_US_URL}/api/cache/keyvalue?account_handle=acme&project_handle=handoff" \
     -H "content-type: application/json" \

@@ -28,3 +28,5 @@ cache_next-*.tar
 # Local workspace and runtime logs.
 /AGENTS.md
 /log/
+/data/
+/target/

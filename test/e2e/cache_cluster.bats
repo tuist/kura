@@ -10,8 +10,6 @@ setup_file() {
   export LOKI_PORT=3201
   export TEMPO_PORT=3301
   export OTLP_PORT=4418
-  export RIAK_HTTP_PORT=8198
-  export RIAK_PB_PORT=8187
   export CACHE_US_URL="http://localhost:${CACHE_US_PORT}"
   export CACHE_EU_URL="http://localhost:${CACHE_EU_PORT}"
   export CACHE_AP_URL="http://localhost:${CACHE_AP_PORT}"
@@ -89,13 +87,19 @@ status_only() {
   [[ "$output" == *'"world"'* ]]
 }
 
-@test "xcode artifacts persist in riak and survive api node restart" {
+@test "xcode artifacts persist on disk and survive api node restart" {
   run status_only -X POST \
     "${CACHE_US_URL}/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios" \
     -H "content-type: application/octet-stream" \
     --data-binary "xcode-binary"
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
+
+  run wait_for_contains \
+    "${CACHE_EU_URL}/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios" \
+    "xcode-binary"
+  [ "$status" -eq 0 ]
+  [ "$output" = "xcode-binary" ]
 
   dc restart cache-eu >/dev/null
   wait_for_http "${CACHE_EU_URL}/up"

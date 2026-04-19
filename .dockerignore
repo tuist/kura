@@ -2,6 +2,17 @@ _build
 deps
 .git
 .github
+config
+data
+data.nonode@nohost
+lib
+log
+log.nonode@nohost
+mix.exs
+mix.lock
+priv
+target
 test
 tmp
+undefined
 docker-compose.override.yml

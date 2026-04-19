@@ -6,34 +6,18 @@ services:
     hostname: cache-us
     domainname: cache-next.internal
     environment: &cache_env
-      MIX_ENV: prod
-      PHX_SERVER: "true"
       PORT: "4000"
-      PHX_HOST: localhost
-      CACHE_REGION: us-east
       TENANT_ID: demo-tenant
       CACHE_TMP_DIR: /tmp/cache-next
-      RIAK_COOKIE: cache-next-riak
-      RIAK_CLUSTER_NODES: riak@cache-us.cache-next.internal,riak@cache-eu.cache-next.internal,riak@cache-ap.cache-next.internal
-      RIAK_HTTP_BIND: 0.0.0.0
-      RIAK_HTTP_PORT: "8098"
-      RIAK_PB_HOST: 127.0.0.1
-      RIAK_PB_BIND: 0.0.0.0
-      RIAK_PB_PORT: "8087"
-      RIAK_PB_POOL_SIZE: "8"
-      RIAK_NODENAME: riak@cache-us.cache-next.internal
-      RIAK_SEED_NODE: riak@cache-us.cache-next.internal
-      RIAK_HTTP_ENDPOINTS: http://127.0.0.1:8098
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http_protobuf
-      OTEL_SERVICE_NAME: cache-next
-      SECRET_KEY_BASE: 0GSIBal6lNQ0NJbJxL0xGELs7LeV2f3AsE7/ORrr0WpA3xHj1Mni6vKVR0xLjgMY
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=cache-next,service.instance.id=cache-us,cache.region=us-east,cache.tenant=demo-tenant
-    depends_on:
-      tempo:
-        condition: service_started
+      CACHE_DATA_DIR: /var/cache/cache-next
+      CACHE_REGION: us-east
+      CACHE_NODE_URL: http://cache-us.cache-next.internal:4000
+      CACHE_PEERS: http://cache-us.cache-next.internal:4000,http://cache-eu.cache-next.internal:4000,http://cache-ap.cache-next.internal:4000
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
+      OTEL_SERVICE_NAME: cache-us
+      OTEL_DEPLOYMENT_ENVIRONMENT: local
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8098/ping >/dev/null && curl -fsS http://localhost:4000/up >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 18
@@ -42,10 +26,8 @@ services:
       cache.tenant: demo-tenant
     ports:
       - "${CACHE_US_PORT:-4101}:4000"
-      - "${RIAK_HTTP_PORT:-8098}:8098"
-      - "${RIAK_PB_PORT:-8087}:8087"
     volumes:
-      - riak-us-data:/opt/riak/data
+      - cache-us-data:/var/cache/cache-next
     networks:
       default:
         aliases:
@@ -60,16 +42,14 @@ services:
     environment:
       <<: *cache_env
       CACHE_REGION: eu-west
-      RIAK_NODENAME: riak@cache-eu.cache-next.internal
-      RIAK_SEED_NODE: riak@cache-us.cache-next.internal
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=cache-next,service.instance.id=cache-eu,cache.region=eu-west,cache.tenant=demo-tenant
+      CACHE_NODE_URL: http://cache-eu.cache-next.internal:4000
+      CACHE_PEERS: http://cache-us.cache-next.internal:4000,http://cache-eu.cache-next.internal:4000,http://cache-ap.cache-next.internal:4000
+      OTEL_SERVICE_NAME: cache-eu
     depends_on:
       cache-us:
         condition: service_healthy
-      tempo:
-        condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8098/ping >/dev/null && curl -fsS http://localhost:4000/up >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 18
@@ -79,7 +59,7 @@ services:
     ports:
       - "${CACHE_EU_PORT:-4102}:4000"
     volumes:
-      - riak-eu-data:/opt/riak/data
+      - cache-eu-data:/var/cache/cache-next
     networks:
       default:
         aliases:
@@ -94,16 +74,14 @@ services:
     environment:
       <<: *cache_env
       CACHE_REGION: ap-south
-      RIAK_NODENAME: riak@cache-ap.cache-next.internal
-      RIAK_SEED_NODE: riak@cache-us.cache-next.internal
-      OTEL_RESOURCE_ATTRIBUTES: service.namespace=cache-next,service.instance.id=cache-ap,cache.region=ap-south,cache.tenant=demo-tenant
+      CACHE_NODE_URL: http://cache-ap.cache-next.internal:4000
+      CACHE_PEERS: http://cache-us.cache-next.internal:4000,http://cache-eu.cache-next.internal:4000,http://cache-ap.cache-next.internal:4000
+      OTEL_SERVICE_NAME: cache-ap
     depends_on:
       cache-eu:
         condition: service_healthy
-      tempo:
-        condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8098/ping >/dev/null && curl -fsS http://localhost:4000/up >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 18
@@ -113,7 +91,7 @@ services:
     ports:
       - "${CACHE_AP_PORT:-4103}:4000"
     volumes:
-      - riak-ap-data:/opt/riak/data
+      - cache-ap-data:/var/cache/cache-next
     networks:
       default:
         aliases:
@@ -173,6 +151,6 @@ services:
       - ./ops/grafana/dashboards:/etc/grafana/dashboards:ro
 
 volumes:
-  riak-us-data:
-  riak-eu-data:
-  riak-ap-data:
+  cache-us-data:
+  cache-eu-data:
+  cache-ap-data:
