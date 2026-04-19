@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Mutex, time::Duration};
 
 use axum::http::StatusCode;
 use prometheus_client::{
@@ -17,9 +14,8 @@ use prometheus_client::{
 
 use crate::{domain::ArtifactKind, utils::replication_target_label};
 
-#[derive(Clone)]
 pub struct Metrics {
-    registry: Arc<Mutex<Registry>>,
+    registry: Mutex<Registry>,
     http_requests: Family<HttpRequestLabels, Counter>,
     http_request_duration: Family<HttpRouteLabels, Histogram>,
     http_exceptions: Family<HttpExceptionLabels, Counter>,
@@ -112,7 +108,7 @@ impl Metrics {
         );
 
         let metrics = Self {
-            registry: Arc::new(Mutex::new(registry)),
+            registry: Mutex::new(registry),
             http_requests,
             http_request_duration,
             http_exceptions,

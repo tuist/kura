@@ -272,6 +272,7 @@ mod tests {
         .await;
 
         let manifest = context
+            .state
             .store
             .persist_artifact_from_bytes(
                 ArtifactKind::Xcode,
@@ -285,6 +286,7 @@ mod tests {
         enqueue_replication_for_artifact(&context.state, &manifest);
 
         let messages = context
+            .state
             .store
             .outbox_messages()
             .expect("failed to read outbox messages");
@@ -307,6 +309,7 @@ mod tests {
         .await;
 
         let manifest = source
+            .state
             .store
             .persist_artifact_from_bytes(
                 ArtifactKind::Keyvalue,
@@ -323,6 +326,7 @@ mod tests {
             .expect("failed to process outbox");
 
         let replicated = remote
+            .state
             .store
             .fetch_artifact(ArtifactKind::Keyvalue, "ios", "cas-1")
             .expect("failed to fetch replicated artifact")
@@ -333,6 +337,7 @@ mod tests {
         );
 
         source
+            .state
             .store
             .enqueue(OutboxMessage {
                 target: remote_url,
@@ -348,6 +353,7 @@ mod tests {
 
         assert!(
             remote
+                .state
                 .store
                 .fetch_artifact(ArtifactKind::Keyvalue, "ios", "cas-1")
                 .expect("failed to fetch remote artifact")

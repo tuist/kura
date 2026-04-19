@@ -952,6 +952,7 @@ mod tests {
     async fn clean_project_removes_existing_artifacts() {
         let context = test_context(|_| {}).await;
         context
+            .state
             .store
             .persist_artifact_from_bytes(
                 ArtifactKind::Xcode,

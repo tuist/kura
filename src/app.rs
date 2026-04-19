@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
+    future::Future,
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
     time::Duration,
 };
 
@@ -20,24 +20,24 @@ use crate::{
 };
 
 pub async fn run() -> Result<(), String> {
-    let config = Arc::new(Config::from_env());
-    let tracer_provider = init_tracing(config.as_ref());
+    let config = Config::from_env();
+    let tracer_provider = init_tracing(&config);
 
     config
         .ensure_directories()
         .await
         .map_err(|error| format!("failed to create directories: {error}"))?;
 
-    let store = Arc::new(Store::open(config.clone())?);
-    let metrics = Arc::new(Metrics::new(config.region.clone(), config.account.clone()));
-    let members = Arc::new(RwLock::new(BTreeSet::new()));
+    let store = Store::open(&config)?;
+    let metrics = Metrics::new(config.region.clone(), config.account.clone());
+    let members = RwLock::new(BTreeSet::new());
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
-    let notify = Arc::new(Notify::new());
+    let notify = Notify::new();
 
-    let state = Arc::new(AppState {
+    let state = std::sync::Arc::new(AppState {
         config,
         store,
         metrics,
@@ -86,8 +86,69 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    wait_for_shutdown_signal(ctrl_c, terminate).await;
+}
+
+async fn wait_for_shutdown_signal<C, T>(ctrl_c: C, terminate: T)
+where
+    C: Future<Output = ()>,
+    T: Future<Output = ()>,
+{
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::{sync::oneshot, time::timeout};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_for_shutdown_signal_returns_when_ctrl_c_resolves() {
+        let (ctrl_c_tx, ctrl_c_rx) = oneshot::channel::<()>();
+        let (_terminate_tx, terminate_rx) = oneshot::channel::<()>();
+
+        let waiter = tokio::spawn(wait_for_shutdown_signal(
+            async move {
+                let _ = ctrl_c_rx.await;
+            },
+            async move {
+                let _ = terminate_rx.await;
+            },
+        ));
+
+        ctrl_c_tx.send(()).expect("ctrl-c sender should be open");
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown waiter should return after ctrl-c")
+            .expect("shutdown waiter task should finish cleanly");
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_signal_returns_when_terminate_resolves() {
+        let (_ctrl_c_tx, ctrl_c_rx) = oneshot::channel::<()>();
+        let (terminate_tx, terminate_rx) = oneshot::channel::<()>();
+
+        let waiter = tokio::spawn(wait_for_shutdown_signal(
+            async move {
+                let _ = ctrl_c_rx.await;
+            },
+            async move {
+                let _ = terminate_rx.await;
+            },
+        ));
+
+        terminate_tx
+            .send(())
+            .expect("terminate sender should be open");
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown waiter should return after terminate")
+            .expect("shutdown waiter task should finish cleanly");
     }
 }

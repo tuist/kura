@@ -10,8 +10,6 @@ use crate::{config::Config, metrics::Metrics, state::AppState, store::Store};
 
 pub(crate) struct TestContext {
     pub _temp_dir: TempDir,
-    pub _config: Arc<Config>,
-    pub store: Arc<Store>,
     pub state: Arc<AppState>,
 }
 
@@ -31,26 +29,23 @@ where
         .await
         .expect("failed to create test directories");
 
-    let config = Arc::new(config);
-    let store = Arc::new(Store::open(config.clone()).expect("failed to open test store"));
-    let metrics = Arc::new(Metrics::new(config.region.clone(), config.account.clone()));
+    let store = Store::open(&config).expect("failed to open test store");
+    let metrics = Metrics::new(config.region.clone(), config.account.clone());
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("failed to build test client");
     let state = Arc::new(AppState {
-        config: config.clone(),
-        store: store.clone(),
+        config,
+        store,
         metrics,
         client,
-        notify: Arc::new(Notify::new()),
-        members: Arc::new(RwLock::new(BTreeSet::new())),
+        notify: Notify::new(),
+        members: RwLock::new(BTreeSet::new()),
     });
 
     TestContext {
         _temp_dir: temp_dir,
-        _config: config,
-        store,
         state,
     }
 }

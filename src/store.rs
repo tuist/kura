@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch};
@@ -22,14 +21,15 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
 pub struct Store {
-    db: Arc<DB>,
-    config: Arc<Config>,
+    db: DB,
+    account: String,
+    tmp_dir: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl Store {
-    pub fn open(config: Arc<Config>) -> Result<Self, String> {
+    pub fn open(config: &Config) -> Result<Self, String> {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -47,8 +47,10 @@ impl Store {
             .map_err(|error| format!("failed to open RocksDB: {error}"))?;
 
         Ok(Self {
-            db: Arc::new(db),
-            config,
+            db,
+            account: config.account.clone(),
+            tmp_dir: config.tmp_dir.clone(),
+            data_dir: config.data_dir.clone(),
         })
     }
 
@@ -58,7 +60,7 @@ impl Store {
         project_handle: &str,
         key: &str,
     ) -> Result<bool, String> {
-        let artifact_id = artifact_storage_id(kind, &self.config.account, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.account, project_handle, key);
         match self.manifest(&artifact_id)? {
             Some(manifest) => Ok(Path::new(&manifest.blob_path).exists()),
             None => Ok(false),
@@ -84,7 +86,7 @@ impl Store {
         project_handle: &str,
         key: &str,
     ) -> Result<Option<ArtifactManifest>, String> {
-        let artifact_id = artifact_storage_id(kind, &self.config.account, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.account, project_handle, key);
         match self.manifest(&artifact_id)? {
             Some(manifest) if Path::new(&manifest.blob_path).exists() => Ok(Some(manifest)),
             Some(_) => Ok(None),
@@ -100,8 +102,8 @@ impl Store {
         content_type: &str,
         source_path: &Path,
     ) -> Result<ArtifactManifest, String> {
-        let artifact_id = artifact_storage_id(kind, &self.config.account, project_handle, key);
-        let destination = blob_path(&self.config.data_dir, kind, &artifact_id);
+        let artifact_id = artifact_storage_id(kind, &self.account, project_handle, key);
+        let destination = blob_path(&self.data_dir, kind, &artifact_id);
         let parent = destination
             .parent()
             .ok_or_else(|| "missing blob parent directory".to_string())?;
@@ -161,7 +163,7 @@ impl Store {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<ArtifactManifest, String> {
-        let temp_path = temp_file_path(&self.config.tmp_dir.join("uploads"), "replication");
+        let temp_path = temp_file_path(&self.tmp_dir.join("uploads"), "replication");
         std::fs::write(&temp_path, bytes)
             .map_err(|error| format!("failed to write temp blob: {error}"))?;
         self.persist_artifact_from_path(kind, project_handle, key, content_type, &temp_path)
@@ -268,7 +270,7 @@ impl Store {
         let next_total = next_total_size(&upload.parts, part_number, size);
         validate_total_size(next_total, MAX_MODULE_TOTAL_BYTES)?;
 
-        let upload_dir = self.config.data_dir.join("multipart").join(upload_id);
+        let upload_dir = self.data_dir.join("multipart").join(upload_id);
         std::fs::create_dir_all(&upload_dir).map_err(|error| {
             MultipartError::Other(format!("failed to create multipart dir: {error}"))
         })?;
@@ -322,7 +324,7 @@ impl Store {
             return Err(MultipartError::PartsMismatch);
         }
 
-        let assembled_path = temp_file_path(&self.config.tmp_dir.join("uploads"), "module");
+        let assembled_path = temp_file_path(&self.tmp_dir.join("uploads"), "module");
         let mut assembled = std::fs::File::create(&assembled_path).map_err(|error| {
             MultipartError::Other(format!("failed to create assembled artifact: {error}"))
         })?;
@@ -360,7 +362,7 @@ impl Store {
 
     pub fn abort_multipart_upload(&self, upload_id: &str) -> Result<(), String> {
         if let Some(upload) = self.multipart_upload(upload_id)? {
-            let _ = std::fs::remove_dir_all(self.config.data_dir.join("multipart").join(upload_id));
+            let _ = std::fs::remove_dir_all(self.data_dir.join("multipart").join(upload_id));
             self.db
                 .delete_cf(self.cf(CF_MULTIPART_UPLOADS), upload_id.as_bytes())
                 .map_err(|error| format!("failed to delete multipart upload: {error}"))?;
@@ -429,7 +431,7 @@ mod tests {
 
     use crate::{config::Config, domain::ReplicationOperation};
 
-    fn temp_store() -> (TempDir, Arc<Config>, Store) {
+    fn temp_store() -> (TempDir, Config, Store) {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let mut config = Config::from_lookup(|_| None);
         config.tmp_dir = temp_dir.path().join("tmp");
@@ -441,8 +443,7 @@ mod tests {
         std::fs::create_dir_all(config.data_dir.join("blobs")).expect("failed to create blobs dir");
         std::fs::create_dir_all(config.data_dir.join("multipart"))
             .expect("failed to create multipart dir");
-        let config = Arc::new(config);
-        let store = Store::open(config.clone()).expect("failed to open store");
+        let store = Store::open(&config).expect("failed to open store");
         (temp_dir, config, store)
     }
 
