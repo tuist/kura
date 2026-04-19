@@ -168,6 +168,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
