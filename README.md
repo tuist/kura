@@ -1,6 +1,6 @@
 # cache
 
-`cache` is a Rust server for building low-latency cache meshes for accounts, handling distributed cache traffic for build artifacts and metadata.
+`cache` is a Rust server for building low-latency cache meshes for accounts, handling distributed cache traffic for binary artifacts and metadata.
 
 ## Summary ✨
 
