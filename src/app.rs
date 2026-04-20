@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     future::Future,
     net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -37,7 +38,7 @@ pub async fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
     let notify = Notify::new();
 
-    let state = std::sync::Arc::new(AppState {
+    let state = Arc::new(AppState {
         config,
         store,
         metrics,

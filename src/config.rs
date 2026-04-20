@@ -28,7 +28,7 @@ impl Config {
         let port = lookup("PORT")
             .and_then(|value| value.parse().ok())
             .unwrap_or(4000);
-        let account = lookup("ACCOUNT_ID").unwrap_or_else(|| "demo-account".into());
+        let account = lookup("ACCOUNT_HANDLE").unwrap_or_else(|| "demo-account".into());
         let region = lookup("CACHE_REGION").unwrap_or_else(|| "local".into());
         let tmp_dir = lookup("CACHE_TMP_DIR")
             .map(PathBuf::from)
@@ -115,7 +115,7 @@ mod tests {
     fn from_lookup_parses_overrides() {
         let config = config_from(&[
             ("PORT", "4500"),
-            ("ACCOUNT_ID", "acme"),
+            ("ACCOUNT_HANDLE", "acme"),
             ("CACHE_REGION", "eu_west"),
             ("CACHE_TMP_DIR", "/tmp/cache"),
             ("CACHE_DATA_DIR", "/tmp/cache-data"),

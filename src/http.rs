@@ -204,9 +204,9 @@ async fn up(State(state): State<SharedState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "ok",
-        "account": state.config.account,
-        "region": state.config.region,
-        "node": state.config.region,
+        "account": state.config.account.clone(),
+        "region": state.config.region.clone(),
+        "node": state.config.region.clone(),
         "connected_nodes": all_members.iter().cloned().filter(|region| region != &state.config.region).collect::<Vec<_>>(),
         "ring_members": all_members.len(),
         "members": all_members.into_iter().collect::<Vec<_>>(),
@@ -581,8 +581,8 @@ async fn clean_project(
 
 async fn internal_status(State(state): State<SharedState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "region": state.config.region,
-        "account": state.config.account,
+        "region": state.config.region.clone(),
+        "account": state.config.account.clone(),
     }))
 }
 
@@ -638,12 +638,12 @@ async fn internal_delete_project(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Response {
-    let project_handle = match params.get("project_handle") {
-        Some(value) => value,
-        None => return error_response(StatusCode::BAD_REQUEST, "Missing project_handle"),
+    let project_handle = match required_param(&params, "project_handle") {
+        Ok(project_handle) => project_handle,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.delete_project(project_handle) {
+    match state.store.delete_project(&project_handle) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
