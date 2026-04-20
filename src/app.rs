@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub async fn run() -> Result<(), String> {
-    let config = Config::from_env();
+    let config = Config::from_env().map_err(|error| format!("invalid configuration: {error}"))?;
     let tracer_provider = init_tracing(&config);
 
     config

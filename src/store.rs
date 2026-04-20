@@ -433,9 +433,18 @@ mod tests {
 
     fn temp_store() -> (TempDir, Config, Store) {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let mut config = Config::from_lookup(|_| None);
-        config.tmp_dir = temp_dir.path().join("tmp");
-        config.data_dir = temp_dir.path().join("data");
+        let config = Config {
+            port: 0,
+            account: "test-account".into(),
+            region: "local".into(),
+            tmp_dir: temp_dir.path().join("tmp"),
+            data_dir: temp_dir.path().join("data"),
+            node_url: "http://127.0.0.1:0".into(),
+            peers: vec!["http://127.0.0.1:0".into()],
+            otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
+            otel_service_name: "cache-test".into(),
+            otel_deployment_environment: "test".into(),
+        };
         std::fs::create_dir_all(config.tmp_dir.join("uploads"))
             .expect("failed to create upload temp dir");
         std::fs::create_dir_all(config.data_dir.join("rocksdb"))

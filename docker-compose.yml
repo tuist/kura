@@ -6,16 +6,16 @@ services:
     hostname: cache-us
     domainname: cache.internal
     environment: &cache_env
-      PORT: "4000"
-      ACCOUNT_HANDLE: default
-      CACHE_TMP_DIR: /tmp/cache
-      CACHE_DATA_DIR: /var/cache/cache
-      CACHE_REGION: us-east
-      CACHE_NODE_URL: http://cache-us.cache.internal:4000
-      CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
-      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
-      OTEL_SERVICE_NAME: cache-us
-      OTEL_DEPLOYMENT_ENVIRONMENT: local
+      TUIST_CACHE_PORT: "4000"
+      TUIST_CACHE_ACCOUNT_HANDLE: default
+      TUIST_CACHE_TMP_DIR: /tmp/cache
+      TUIST_CACHE_DATA_DIR: /var/cache/cache
+      TUIST_CACHE_REGION: us-east
+      TUIST_CACHE_NODE_URL: http://cache-us.cache.internal:4000
+      TUIST_CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
+      TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
+      TUIST_CACHE_OTEL_SERVICE_NAME: cache-us
+      TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT: local
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
       interval: 10s
@@ -41,10 +41,10 @@ services:
     domainname: cache.internal
     environment:
       <<: *cache_env
-      CACHE_REGION: eu-west
-      CACHE_NODE_URL: http://cache-eu.cache.internal:4000
-      CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
-      OTEL_SERVICE_NAME: cache-eu
+      TUIST_CACHE_REGION: eu-west
+      TUIST_CACHE_NODE_URL: http://cache-eu.cache.internal:4000
+      TUIST_CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
+      TUIST_CACHE_OTEL_SERVICE_NAME: cache-eu
     depends_on:
       cache-us:
         condition: service_healthy
@@ -73,10 +73,10 @@ services:
     domainname: cache.internal
     environment:
       <<: *cache_env
-      CACHE_REGION: ap-south
-      CACHE_NODE_URL: http://cache-ap.cache.internal:4000
-      CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
-      OTEL_SERVICE_NAME: cache-ap
+      TUIST_CACHE_REGION: ap-south
+      TUIST_CACHE_NODE_URL: http://cache-ap.cache.internal:4000
+      TUIST_CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
+      TUIST_CACHE_OTEL_SERVICE_NAME: cache-ap
     depends_on:
       cache-eu:
         condition: service_healthy

@@ -25,27 +25,18 @@ pub fn init_tracing(config: &Config) -> Option<SdkTracerProvider> {
         .unwrap_or_else(|_| "cache=info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
 
-    match config.otlp_traces_endpoint.as_deref() {
-        Some(endpoint) => match build_tracer_provider(config, endpoint) {
-            Ok(tracer_provider) => {
-                let tracer = tracer_provider.tracer("cache");
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer)
-                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                    .init();
-                Some(tracer_provider)
-            }
-            Err(error) => {
-                eprintln!("failed to initialize OTLP tracing, falling back to logs only: {error}");
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer)
-                    .init();
-                None
-            }
-        },
-        None => {
+    match build_tracer_provider(config, &config.otlp_traces_endpoint) {
+        Ok(tracer_provider) => {
+            let tracer = tracer_provider.tracer("cache");
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
+            Some(tracer_provider)
+        }
+        Err(error) => {
+            eprintln!("failed to initialize OTLP tracing, falling back to logs only: {error}");
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer)

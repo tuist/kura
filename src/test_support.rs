@@ -18,11 +18,18 @@ where
     F: FnOnce(&mut Config),
 {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-    let mut config = Config::from_lookup(|_| None);
-    config.tmp_dir = temp_dir.path().join("tmp");
-    config.data_dir = temp_dir.path().join("data");
-    config.node_url = "http://127.0.0.1:0".into();
-    config.peers = vec![config.node_url.clone()];
+    let mut config = Config {
+        port: 0,
+        account: "test-account".into(),
+        region: "local".into(),
+        tmp_dir: temp_dir.path().join("tmp"),
+        data_dir: temp_dir.path().join("data"),
+        node_url: "http://127.0.0.1:0".into(),
+        peers: vec!["http://127.0.0.1:0".into()],
+        otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
+        otel_service_name: "cache-test".into(),
+        otel_deployment_environment: "test".into(),
+    };
     override_config(&mut config);
     config
         .ensure_directories()
