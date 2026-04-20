@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     constants::{
-        CF_MANIFESTS, CF_MULTIPART_UPLOADS, CF_OUTBOX, CF_PROJECT_ARTIFACTS, MAX_MODULE_TOTAL_BYTES,
+        MAX_MODULE_TOTAL_BYTES, ROCKSDB_CF_MANIFESTS, ROCKSDB_CF_MULTIPART_UPLOADS,
+        ROCKSDB_CF_OUTBOX, ROCKSDB_CF_PROJECT_ARTIFACTS,
     },
     domain::{
         ArtifactKind, ArtifactManifest, MultipartError, MultipartPart, MultipartUpload,
@@ -36,10 +37,10 @@ impl Store {
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
         let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_MANIFESTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_PROJECT_ARTIFACTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_MULTIPART_UPLOADS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_OUTBOX, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_MANIFESTS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_PROJECT_ARTIFACTS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_MULTIPART_UPLOADS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_OUTBOX, Options::default()),
         ];
 
         let db_path = config.data_dir.join("rocksdb");
@@ -70,7 +71,7 @@ impl Store {
     pub fn manifest(&self, artifact_id: &str) -> Result<Option<ArtifactManifest>, String> {
         let raw = self
             .db
-            .get_cf(self.cf(CF_MANIFESTS), artifact_id.as_bytes())
+            .get_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes())
             .map_err(|error| format!("failed to read manifest: {error}"))?;
 
         raw.map(|bytes| {
@@ -138,12 +139,12 @@ impl Store {
         let manifest_bytes = serde_json::to_vec(&manifest)
             .map_err(|error| format!("failed to encode manifest: {error}"))?;
         batch.put_cf(
-            self.cf(CF_MANIFESTS),
+            self.cf(ROCKSDB_CF_MANIFESTS),
             artifact_id.as_bytes(),
             manifest_bytes,
         );
         batch.put_cf(
-            self.cf(CF_PROJECT_ARTIFACTS),
+            self.cf(ROCKSDB_CF_PROJECT_ARTIFACTS),
             project_artifact_index_key(project_handle, &artifact_id).as_bytes(),
             [],
         );
@@ -175,7 +176,7 @@ impl Store {
         let mut blob_paths = Vec::new();
 
         let iter = self.db.iterator_cf(
-            self.cf(CF_PROJECT_ARTIFACTS),
+            self.cf(ROCKSDB_CF_PROJECT_ARTIFACTS),
             IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
         );
 
@@ -194,8 +195,8 @@ impl Store {
                 blob_paths.push(PathBuf::from(manifest.blob_path));
             }
 
-            batch.delete_cf(self.cf(CF_PROJECT_ARTIFACTS), index_key);
-            batch.delete_cf(self.cf(CF_MANIFESTS), artifact_id.as_bytes());
+            batch.delete_cf(self.cf(ROCKSDB_CF_PROJECT_ARTIFACTS), index_key);
+            batch.delete_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes());
         }
 
         self.db
@@ -233,7 +234,7 @@ impl Store {
             .map_err(|error| format!("failed to encode multipart upload: {error}"))?;
         self.db
             .put_cf(
-                self.cf(CF_MULTIPART_UPLOADS),
+                self.cf(ROCKSDB_CF_MULTIPART_UPLOADS),
                 upload_id.as_bytes(),
                 upload_bytes,
             )
@@ -245,7 +246,7 @@ impl Store {
     pub fn multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUpload>, String> {
         let raw = self
             .db
-            .get_cf(self.cf(CF_MULTIPART_UPLOADS), upload_id.as_bytes())
+            .get_cf(self.cf(ROCKSDB_CF_MULTIPART_UPLOADS), upload_id.as_bytes())
             .map_err(|error| format!("failed to load multipart upload: {error}"))?;
 
         raw.map(|bytes| {
@@ -298,7 +299,7 @@ impl Store {
         })?;
         self.db
             .put_cf(
-                self.cf(CF_MULTIPART_UPLOADS),
+                self.cf(ROCKSDB_CF_MULTIPART_UPLOADS),
                 upload_id.as_bytes(),
                 upload_bytes,
             )
@@ -364,7 +365,7 @@ impl Store {
         if let Some(upload) = self.multipart_upload(upload_id)? {
             let _ = std::fs::remove_dir_all(self.data_dir.join("multipart").join(upload_id));
             self.db
-                .delete_cf(self.cf(CF_MULTIPART_UPLOADS), upload_id.as_bytes())
+                .delete_cf(self.cf(ROCKSDB_CF_MULTIPART_UPLOADS), upload_id.as_bytes())
                 .map_err(|error| format!("failed to delete multipart upload: {error}"))?;
 
             for part in upload.parts.values() {
@@ -380,13 +381,15 @@ impl Store {
         let value = serde_json::to_vec(&message)
             .map_err(|error| format!("failed to encode outbox message: {error}"))?;
         self.db
-            .put_cf(self.cf(CF_OUTBOX), key.as_bytes(), value)
+            .put_cf(self.cf(ROCKSDB_CF_OUTBOX), key.as_bytes(), value)
             .map_err(|error| format!("failed to enqueue outbox message: {error}"))
     }
 
     pub fn outbox_messages(&self) -> Result<Vec<(Vec<u8>, OutboxMessage)>, String> {
         let mut messages = Vec::new();
-        let iter = self.db.iterator_cf(self.cf(CF_OUTBOX), IteratorMode::Start);
+        let iter = self
+            .db
+            .iterator_cf(self.cf(ROCKSDB_CF_OUTBOX), IteratorMode::Start);
         for item in iter {
             let (key, value) =
                 item.map_err(|error| format!("failed to iterate outbox: {error}"))?;
@@ -399,7 +402,7 @@ impl Store {
 
     pub fn delete_outbox_message(&self, key: &[u8]) -> Result<(), String> {
         self.db
-            .delete_cf(self.cf(CF_OUTBOX), key)
+            .delete_cf(self.cf(ROCKSDB_CF_OUTBOX), key)
             .map_err(|error| format!("failed to delete outbox entry: {error}"))
     }
 
