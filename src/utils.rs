@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::domain::ArtifactKind;
+use crate::artifact::kind::ArtifactKind;
 
 #[derive(Debug)]
 pub struct TempBodyFile {

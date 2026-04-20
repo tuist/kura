@@ -9,17 +9,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, head, post, put},
 };
+use serde::Deserialize;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, field};
 
 use crate::{
+    artifact::{kind::ArtifactKind, manifest::ArtifactManifest},
     constants::{MAX_GRADLE_BYTES, MAX_MODULE_PART_BYTES, MAX_XCODE_BYTES},
-    domain::{
-        ArtifactKind, ArtifactManifest, CompleteMultipartRequest, KeyValuePutRequest,
-        MultipartError,
-    },
+    multipart::error::MultipartError,
     replication::enqueue_replication_for_artifact,
+    replication::{operation::ReplicationOperation, outbox_message::OutboxMessage},
     state::SharedState,
     telemetry::attach_parent_context,
     utils::{BodyReadError, module_key, read_request_to_temp},
@@ -117,6 +117,22 @@ impl UploadPartQuery {
             part_number,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteMultipartRequest {
+    parts: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyValuePutRequest {
+    cas_id: String,
+    entries: Vec<KeyValueEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyValueEntry {
+    value: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -560,9 +576,9 @@ async fn clean_project(
                 .iter()
                 .filter(|peer| *peer != &state.config.node_url)
             {
-                if let Err(error) = state.store.enqueue(crate::domain::OutboxMessage {
+                if let Err(error) = state.store.enqueue(OutboxMessage {
                     target: peer.clone(),
-                    operation: crate::domain::ReplicationOperation::DeleteProject {
+                    operation: ReplicationOperation::DeleteProject {
                         project_handle: project.project_handle.clone(),
                     },
                 }) {

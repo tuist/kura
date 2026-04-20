@@ -7,15 +7,14 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, W
 use uuid::Uuid;
 
 use crate::{
+    artifact::{kind::ArtifactKind, manifest::ArtifactManifest},
     config::Config,
     constants::{
         MAX_MODULE_TOTAL_BYTES, ROCKSDB_CF_MANIFESTS, ROCKSDB_CF_MULTIPART_UPLOADS,
         ROCKSDB_CF_OUTBOX, ROCKSDB_CF_PROJECT_ARTIFACTS,
     },
-    domain::{
-        ArtifactKind, ArtifactManifest, MultipartError, MultipartPart, MultipartUpload,
-        OutboxMessage,
-    },
+    multipart::{error::MultipartError, part::MultipartPart, upload::MultipartUpload},
+    replication::outbox_message::OutboxMessage,
     utils::{
         artifact_storage_id, blob_path, module_key, now_ms, project_artifact_index_key,
         temp_file_path,
@@ -432,7 +431,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    use crate::{config::Config, domain::ReplicationOperation};
+    use crate::{config::Config, replication::operation::ReplicationOperation};
 
     fn temp_store() -> (TempDir, Config, Store) {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");

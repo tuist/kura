@@ -1,9 +1,10 @@
 mod app;
+mod artifact;
 mod config;
 mod constants;
-mod domain;
 mod http;
 mod metrics;
+mod multipart;
 mod replication;
 mod state;
 mod store;

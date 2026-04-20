@@ -12,7 +12,7 @@ use prometheus_client::{
     registry::Registry,
 };
 
-use crate::{domain::ArtifactKind, utils::replication_target_label};
+use crate::{artifact::kind::ArtifactKind, utils::replication_target_label};
 
 pub struct Metrics {
     registry: Mutex<Registry>,
