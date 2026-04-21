@@ -13,6 +13,8 @@ use tracing::info;
 use crate::{
     config::Config,
     http,
+    io::IoController,
+    memory::MemoryController,
     metrics::Metrics,
     replication::{spawn_membership_task, spawn_outbox_task},
     state::AppState,
@@ -29,8 +31,18 @@ pub async fn run() -> Result<(), String> {
         .await
         .map_err(|error| format!("failed to create directories: {error}"))?;
 
-    let store = Store::open(&config)?;
     let metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
+    let io = IoController::new(
+        metrics.clone(),
+        config.file_descriptor_pool_size,
+        Duration::from_millis(config.file_descriptor_acquire_timeout_ms),
+    );
+    let memory = MemoryController::new(
+        metrics.clone(),
+        config.memory_soft_limit_bytes,
+        config.memory_hard_limit_bytes,
+    );
+    let store = Store::open(&config, io.clone(), memory.clone())?;
     let members = RwLock::new(BTreeSet::new());
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -41,6 +53,8 @@ pub async fn run() -> Result<(), String> {
     let state = Arc::new(AppState {
         config,
         store,
+        io,
+        memory,
         metrics,
         client,
         notify,
@@ -49,6 +63,7 @@ pub async fn run() -> Result<(), String> {
 
     spawn_membership_task(state.clone());
     spawn_outbox_task(state.clone());
+    spawn_snapshot_task(state.clone());
 
     let router = http::router(state.clone());
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.port));
@@ -88,6 +103,96 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     wait_for_shutdown_signal(ctrl_c, terminate).await;
+}
+
+fn spawn_snapshot_task(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let worker_state = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                let snapshot = worker_state.store.snapshot();
+                let memory = process_memory_snapshot();
+                (snapshot, memory)
+            })
+            .await
+            {
+                Ok((Ok(snapshot), memory)) => {
+                    state
+                        .metrics
+                        .update_outbox_messages(snapshot.outbox_messages);
+                    state
+                        .metrics
+                        .update_multipart_uploads(snapshot.multipart_uploads);
+                    for (kind, generation, count) in snapshot.segment_counts {
+                        state
+                            .metrics
+                            .update_segment_generation_count(kind, generation, count);
+                    }
+                    if let Some(memory) = memory {
+                        state
+                            .metrics
+                            .update_process_memory(memory.resident_bytes, memory.virtual_bytes);
+                        let pressure = state.memory.observe(memory.resident_bytes);
+                        let target_bytes = state
+                            .memory
+                            .manifest_cache_target_bytes(state.config.manifest_cache_max_bytes);
+                        let evicted = state.store.trim_manifest_cache_to(target_bytes, "pressure");
+                        if evicted > 0 {
+                            state.metrics.record_memory_action("manifest_cache_trim");
+                        }
+                        state
+                            .metrics
+                            .update_background_work_paused("outbox", state.memory.pause_outbox());
+                        state.metrics.update_background_work_paused(
+                            "segment_refresh",
+                            !state.memory.allow_segment_refresh(),
+                        );
+                        state
+                            .metrics
+                            .update_memory_pressure_state(pressure.as_i64());
+                    }
+                }
+                Ok((Err(error), _)) => {
+                    tracing::warn!("failed to collect store snapshot metrics: {error}");
+                }
+                Err(error) => {
+                    tracing::warn!("snapshot metrics task failed: {error}");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+struct ProcessMemorySnapshot {
+    resident_bytes: u64,
+    virtual_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let resident_bytes = parse_status_memory_kib(&status, "VmRSS:")?.saturating_mul(1024);
+    let virtual_bytes = parse_status_memory_kib(&status, "VmSize:")?.saturating_mul(1024);
+    Some(ProcessMemorySnapshot {
+        resident_bytes,
+        virtual_bytes,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_status_memory_kib(status: &str, field: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 async fn wait_for_shutdown_signal<C, T>(ctrl_c: C, terminate: T)

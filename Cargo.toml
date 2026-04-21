@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = "0.8.9"
 bytes = "1.11.0"
+deadpool = { version = "0.13.0", default-features = false, features = ["unmanaged"] }
 futures-util = "0.3.31"
 hex = "0.4.3"
 http-body-util = "0.1.3"

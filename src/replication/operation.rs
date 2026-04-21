@@ -11,9 +11,13 @@ pub enum ReplicationOperation {
         key: String,
         content_type: String,
         artifact_id: String,
+        #[serde(default)]
+        version_ms: u64,
     },
     DeleteNamespace {
         namespace_id: String,
+        #[serde(default)]
+        version_ms: u64,
     },
 }
 
@@ -41,13 +45,15 @@ mod tests {
                 key: "artifact".into(),
                 content_type: "application/octet-stream".into(),
                 artifact_id: "artifact-id".into(),
+                version_ms: 123,
             }
             .name(),
             "upsert_artifact"
         );
         assert_eq!(
             ReplicationOperation::DeleteNamespace {
-                namespace_id: "ios".into()
+                namespace_id: "ios".into(),
+                version_ms: 456,
             }
             .name(),
             "delete_namespace"

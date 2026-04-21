@@ -6,7 +6,10 @@ use reqwest::Client;
 use tempfile::TempDir;
 use tokio::sync::{Notify, RwLock};
 
-use crate::{config::Config, metrics::Metrics, state::AppState, store::Store};
+use crate::{
+    config::Config, io::IoController, memory::MemoryController, metrics::Metrics, state::AppState,
+    store::Store,
+};
 
 pub(crate) struct TestContext {
     pub _temp_dir: TempDir,
@@ -26,6 +29,15 @@ where
         data_dir: temp_dir.path().join("data"),
         node_url: "http://127.0.0.1:0".into(),
         peers: vec!["http://127.0.0.1:0".into()],
+        file_descriptor_pool_size: 32,
+        file_descriptor_acquire_timeout_ms: 5_000,
+        segment_handle_cache_size: 8,
+        memory_soft_limit_bytes: 128 * 1024 * 1024,
+        memory_hard_limit_bytes: 256 * 1024 * 1024,
+        manifest_cache_max_bytes: 8 * 1024 * 1024,
+        max_keyvalue_bytes: 512 * 1024,
+        rocksdb_max_open_files: 256,
+        rocksdb_max_background_jobs: 2,
         otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
         otel_service_name: "kura-test".into(),
         otel_deployment_environment: "test".into(),
@@ -36,8 +48,19 @@ where
         .await
         .expect("failed to create test directories");
 
-    let store = Store::open(&config).expect("failed to open test store");
     let metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
+    let io = IoController::new(
+        metrics.clone(),
+        config.file_descriptor_pool_size,
+        Duration::from_millis(config.file_descriptor_acquire_timeout_ms),
+    );
+    let memory = MemoryController::new(
+        metrics.clone(),
+        config.memory_soft_limit_bytes,
+        config.memory_hard_limit_bytes,
+    );
+    let store =
+        Store::open(&config, io.clone(), memory.clone()).expect("failed to open test store");
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -45,6 +68,8 @@ where
     let state = Arc::new(AppState {
         config,
         store,
+        io,
+        memory,
         metrics,
         client,
         notify: Notify::new(),

@@ -4,7 +4,7 @@ pub mod outbox_message;
 use std::{collections::BTreeSet, time::Duration};
 
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
-use tokio::{fs, time::sleep};
+use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, field, warn};
 
@@ -33,6 +33,7 @@ pub fn enqueue_replication_for_artifact(state: &SharedState, manifest: &Artifact
                 key: manifest.key.clone(),
                 content_type: manifest.content_type.clone(),
                 artifact_id: manifest.artifact_id.clone(),
+                version_ms: manifest.version_ms,
             },
         }) {
             warn!("failed to enqueue artifact replication for {peer}: {error}");
@@ -86,8 +87,14 @@ pub fn spawn_membership_task(state: SharedState) {
 pub fn spawn_outbox_task(state: SharedState) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = process_outbox(&state).await {
-                warn!("outbox processing failed: {error}");
+            let pause_outbox = state.memory.pause_outbox();
+            state
+                .metrics
+                .update_background_work_paused("outbox", pause_outbox);
+            if !pause_outbox {
+                if let Err(error) = process_outbox(&state).await {
+                    warn!("outbox processing failed: {error}");
+                }
             }
 
             tokio::select! {
@@ -137,26 +144,29 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
             key,
             content_type,
             artifact_id,
+            version_ms,
         } => {
             let manifest = match state.store.manifest(artifact_id)? {
                 Some(manifest) => manifest,
                 None => return Ok(()),
             };
 
-            let file = fs::File::open(&manifest.blob_path).await.map_err(|error| {
-                format!(
-                    "failed to open local blob for replication {}: {error}",
-                    manifest.blob_path
-                )
-            })?;
+            let file = state
+                .store
+                .open_artifact_reader(&manifest)
+                .await
+                .map_err(|error| {
+                    format!("failed to open local artifact for replication: {error}")
+                })?;
 
             let url = format!(
-                "{}/_internal/replicate/artifact?kind={}&namespace_id={}&key={}&content_type={}",
+                "{}/_internal/replicate/artifact?kind={}&namespace_id={}&key={}&content_type={}&version_ms={}",
                 message.target,
                 kind.as_str(),
                 url_encode(namespace_id),
                 url_encode(key),
                 url_encode(content_type),
+                version_ms,
             );
             let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
             let request_span = tracing::info_span!(
@@ -200,11 +210,15 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
             .instrument(request_span)
             .await
         }
-        ReplicationOperation::DeleteNamespace { namespace_id } => {
+        ReplicationOperation::DeleteNamespace {
+            namespace_id,
+            version_ms,
+        } => {
             let url = format!(
-                "{}/_internal/replicate/namespace?namespace_id={}",
+                "{}/_internal/replicate/namespace?namespace_id={}&version_ms={}",
                 message.target,
                 url_encode(namespace_id),
+                version_ms,
             );
             let request_span = tracing::info_span!(
                 "replication.request",
@@ -287,6 +301,7 @@ mod tests {
                 "application/octet-stream",
                 b"hello",
             )
+            .await
             .expect("artifact should persist");
 
         enqueue_replication_for_artifact(&ctx.state, &manifest);
@@ -316,6 +331,7 @@ mod tests {
                 "application/octet-stream",
                 b"payload",
             )
+            .await
             .expect("artifact should persist");
 
         local
@@ -332,9 +348,18 @@ mod tests {
                         .state
                         .store
                         .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact")
+                        .await
                         .expect("artifact fetch should succeed")
                         .expect("artifact should exist")
                         .artifact_id,
+                    version_ms: local
+                        .state
+                        .store
+                        .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact")
+                        .await
+                        .expect("artifact fetch should succeed")
+                        .expect("artifact should exist")
+                        .version_ms,
                 },
             })
             .expect("upsert should enqueue");
@@ -346,6 +371,7 @@ mod tests {
                 target: remote_url,
                 operation: ReplicationOperation::DeleteNamespace {
                     namespace_id: "android".into(),
+                    version_ms: 123,
                 },
             })
             .expect("delete should enqueue");
@@ -358,9 +384,22 @@ mod tests {
             .state
             .store
             .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact")
+            .await
             .expect("artifact fetch should succeed")
             .expect("replicated artifact should exist");
-        assert_eq!(std::fs::read(replicated.blob_path).unwrap(), b"payload");
+        let mut reader = remote
+            .state
+            .store
+            .open_artifact_reader(&replicated)
+            .await
+            .expect("replicated artifact reader should open");
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect("replicated bytes should read");
+        assert_eq!(bytes, b"payload");
 
         let queued = local
             .state

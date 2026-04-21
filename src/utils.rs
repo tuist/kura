@@ -6,10 +6,10 @@ use std::{
 use axum::extract::Request;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::artifact::kind::ArtifactKind;
+use crate::{artifact::kind::ArtifactKind, io::IoController};
 
 #[derive(Debug)]
 pub struct TempBodyFile {
@@ -27,17 +27,17 @@ pub async fn read_request_to_temp(
     request: Request,
     directory: &Path,
     max_bytes: u64,
+    io: &IoController,
 ) -> Result<TempBodyFile, BodyReadError> {
     let temp_path = temp_file_path(directory, "upload");
     if let Some(parent) = temp_path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|error| BodyReadError::Io(format!("failed to create temp dir: {error}")))?;
+        io.create_dir_all(parent).await.map_err(BodyReadError::Io)?;
     }
 
-    let mut file = fs::File::create(&temp_path)
+    let mut file = io
+        .create_file(&temp_path)
         .await
-        .map_err(|error| BodyReadError::Io(format!("failed to create temp file: {error}")))?;
+        .map_err(BodyReadError::Io)?;
     let mut stream = request.into_body().into_data_stream();
     let mut size = 0_u64;
 
@@ -46,7 +46,7 @@ pub async fn read_request_to_temp(
             .map_err(|error| BodyReadError::Io(format!("failed to read request body: {error}")))?;
         size += chunk.len() as u64;
         if size > max_bytes {
-            let _ = fs::remove_file(&temp_path).await;
+            io.remove_file_if_exists(&temp_path).await;
             return Err(BodyReadError::TooLarge);
         }
 
@@ -95,8 +95,27 @@ pub fn blob_path(data_dir: &Path, kind: ArtifactKind, artifact_id: &str) -> Path
         .join(artifact_id)
 }
 
+pub fn segment_path(data_dir: &Path, kind: ArtifactKind, segment_id: &str) -> PathBuf {
+    data_dir
+        .join("segments")
+        .join(kind.as_str())
+        .join(format!("{segment_id}.seg"))
+}
+
 pub fn namespace_artifact_index_key(namespace_id: &str, artifact_id: &str) -> String {
     format!("{namespace_id}\0{artifact_id}")
+}
+
+pub fn segment_artifact_index_key(
+    kind: ArtifactKind,
+    segment_id: &str,
+    artifact_id: &str,
+) -> String {
+    format!("{}\0{segment_id}\0{artifact_id}", kind.as_str())
+}
+
+pub fn segment_artifact_index_prefix(kind: ArtifactKind, segment_id: &str) -> String {
+    format!("{}\0{segment_id}\0", kind.as_str())
 }
 
 pub fn now_ms() -> u64 {
@@ -135,6 +154,7 @@ pub fn replication_target_label(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use axum::body::Body;
     use tempfile::tempdir;
 
@@ -186,14 +206,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn segment_paths_are_partitioned_by_kind() {
+        let path = segment_path(Path::new("/data"), ArtifactKind::Gradle, "01962a2d-8f1f");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/data/segments/gradle/01962a2d-8f1f.seg")
+        );
+    }
+
+    #[test]
+    fn segment_artifact_index_keys_include_kind_segment_and_artifact() {
+        assert_eq!(
+            segment_artifact_index_key(ArtifactKind::Module, "segment-1", "artifact-1"),
+            "module\0segment-1\0artifact-1"
+        );
+        assert_eq!(
+            segment_artifact_index_prefix(ArtifactKind::Module, "segment-1"),
+            "module\0segment-1\0"
+        );
+    }
+
     #[tokio::test]
     async fn read_request_to_temp_persists_request_body() {
         let directory = tempdir().expect("failed to create temp dir");
+        let io = IoController::new(
+            Metrics::new("eu-west".into(), "acme".into()),
+            8,
+            Duration::from_secs(1),
+        );
         let request = Request::builder()
             .body(Body::from("hello"))
             .expect("failed to build request");
 
-        let temp = read_request_to_temp(request, directory.path(), 10)
+        let temp = read_request_to_temp(request, directory.path(), 10, &io)
             .await
             .expect("failed to read request to temp");
 
@@ -207,11 +254,16 @@ mod tests {
     #[tokio::test]
     async fn read_request_to_temp_rejects_large_payloads() {
         let directory = tempdir().expect("failed to create temp dir");
+        let io = IoController::new(
+            Metrics::new("eu-west".into(), "acme".into()),
+            8,
+            Duration::from_secs(1),
+        );
         let request = Request::builder()
             .body(Body::from("hello"))
             .expect("failed to build request");
 
-        let error = read_request_to_temp(request, directory.path(), 4)
+        let error = read_request_to_temp(request, directory.path(), 4, &io)
             .await
             .expect_err("expected body reader to reject oversized request");
 

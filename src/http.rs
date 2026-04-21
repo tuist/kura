@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{MatchedPath, Path as AxumPath, Query, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -10,7 +10,6 @@ use axum::{
     routing::{delete, get, head, post, put},
 };
 use serde::Deserialize;
-use tokio::fs;
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, field};
 
@@ -154,6 +153,7 @@ struct ReplicateArtifactQuery {
     namespace_id: String,
     key: String,
     content_type: String,
+    version_ms: u64,
 }
 
 impl ReplicateArtifactQuery {
@@ -163,6 +163,7 @@ impl ReplicateArtifactQuery {
             namespace_id: required_param(params, "namespace_id")?,
             key: required_param(params, "key")?,
             content_type: required_param(params, "content_type")?,
+            version_ms: optional_u64_param(params, "version_ms")?.unwrap_or_default(),
         })
     }
 }
@@ -172,6 +173,17 @@ fn required_param(params: &HashMap<String, String>, key: &str) -> Result<String,
         .get(key)
         .cloned()
         .ok_or_else(|| format!("Missing {key}"))
+}
+
+fn optional_u64_param(params: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {
+    params
+        .get(key)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("Invalid {key}: {error}"))
+        })
+        .transpose()
 }
 
 async fn track_http_metrics(
@@ -261,11 +273,33 @@ async fn get_keyvalue(
 async fn put_keyvalue(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
-    Json(body): Json<KeyValuePutRequest>,
+    request: Request,
 ) -> Response {
     let namespace = match NamespaceQuery::from_params(&params) {
         Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+
+    let body = match to_bytes(request.into_body(), state.config.max_keyvalue_bytes).await {
+        Ok(body) => body,
+        Err(error) => {
+            state
+                .metrics
+                .record_memory_action("keyvalue_payload_rejected");
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Failed to read key-value request body: {error}"),
+            );
+        }
+    };
+    let body = match serde_json::from_slice::<KeyValuePutRequest>(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid key-value payload: {error}"),
+            );
+        }
     };
 
     let cas_id = body.cas_id.clone();
@@ -273,15 +307,27 @@ async fn put_keyvalue(
         "cas_id": body.cas_id,
         "entries": body.entries.into_iter().map(|entry| serde_json::json!({ "value": entry.value })).collect::<Vec<_>>()
     });
-    let payload_bytes = payload.to_string();
+    let payload_bytes = match serde_json::to_vec(&payload) {
+        Ok(payload_bytes) => payload_bytes,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to encode key-value payload: {error}"),
+            );
+        }
+    };
 
-    match state.store.persist_artifact_from_bytes(
-        ArtifactKind::Keyvalue,
-        &namespace.namespace_id,
-        &cas_id,
-        "application/json",
-        payload_bytes.as_bytes(),
-    ) {
+    match state
+        .store
+        .persist_artifact_from_bytes(
+            ArtifactKind::Keyvalue,
+            &namespace.namespace_id,
+            &cas_id,
+            "application/json",
+            &payload_bytes,
+        )
+        .await
+    {
         Ok(manifest) => {
             enqueue_replication_for_artifact(&state, &manifest);
             state
@@ -388,11 +434,15 @@ async fn head_module(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.artifact_exists(
-        ArtifactKind::Module,
-        &query.namespace.namespace_id,
-        &query.artifact_key(),
-    ) {
+    match state
+        .store
+        .artifact_exists(
+            ArtifactKind::Module,
+            &query.namespace.namespace_id,
+            &query.artifact_key(),
+        )
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => error_response(
@@ -429,11 +479,15 @@ async fn start_module_upload(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.artifact_exists(
-        ArtifactKind::Module,
-        &query.namespace.namespace_id,
-        &query.artifact_key(),
-    ) {
+    match state
+        .store
+        .artifact_exists(
+            ArtifactKind::Module,
+            &query.namespace.namespace_id,
+            &query.artifact_key(),
+        )
+        .await
+    {
         Ok(true) => {
             Json(serde_json::json!({ "upload_id": serde_json::Value::Null })).into_response()
         }
@@ -471,6 +525,7 @@ async fn upload_module_part(
         request,
         &state.config.tmp_dir.join("parts"),
         MAX_MODULE_PART_BYTES,
+        &state.io,
     )
     .await
     {
@@ -489,18 +544,19 @@ async fn upload_module_part(
     match state
         .store
         .add_multipart_part(&query.upload_id, query.part_number, &temp.path, temp.size)
+        .await
     {
         Ok(()) => {
             state.metrics.record_multipart_part("ok");
             StatusCode::NO_CONTENT.into_response()
         }
         Err(MultipartError::NotFound) => {
-            let _ = std::fs::remove_file(&temp.path);
+            state.io.remove_file_if_exists(&temp.path).await;
             state.metrics.record_multipart_part("not_found");
             error_response(StatusCode::NOT_FOUND, "Upload not found")
         }
         Err(MultipartError::TotalSizeExceeded) => {
-            let _ = std::fs::remove_file(&temp.path);
+            state.io.remove_file_if_exists(&temp.path).await;
             state.metrics.record_multipart_part("too_large");
             error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -508,7 +564,7 @@ async fn upload_module_part(
             )
         }
         Err(MultipartError::Other(error)) => {
-            let _ = std::fs::remove_file(&temp.path);
+            state.io.remove_file_if_exists(&temp.path).await;
             state.metrics.record_multipart_part("error");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -516,7 +572,7 @@ async fn upload_module_part(
             )
         }
         Err(MultipartError::PartsMismatch) => {
-            let _ = std::fs::remove_file(&temp.path);
+            state.io.remove_file_if_exists(&temp.path).await;
             state.metrics.record_multipart_part("parts_mismatch");
             error_response(StatusCode::BAD_REQUEST, "Parts mismatch")
         }
@@ -536,6 +592,7 @@ async fn complete_module_upload(
     match state
         .store
         .complete_multipart_upload(&query.upload_id, &body.parts)
+        .await
     {
         Ok(manifest) => {
             enqueue_replication_for_artifact(&state, &manifest);
@@ -568,8 +625,8 @@ async fn clean_namespace(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.delete_namespace(&namespace.namespace_id) {
-        Ok(()) => {
+    match state.store.delete_namespace(&namespace.namespace_id).await {
+        Ok(version_ms) => {
             for peer in state
                 .config
                 .peers
@@ -580,6 +637,7 @@ async fn clean_namespace(
                     target: peer.clone(),
                     operation: ReplicationOperation::DeleteNamespace {
                         namespace_id: namespace.namespace_id.clone(),
+                        version_ms,
                     },
                 }) {
                     tracing::warn!("failed to enqueue namespace delete for {peer}: {error}");
@@ -617,8 +675,63 @@ async fn internal_replicate_artifact(
         None => return error_response(StatusCode::BAD_REQUEST, "Invalid artifact kind"),
     };
 
-    let temp = match read_request_to_temp(request, &state.config.tmp_dir.join("uploads"), u64::MAX)
-        .await
+    match state.store.artifact_version_is_current(
+        kind,
+        &query.namespace_id,
+        &query.key,
+        query.version_ms,
+    ) {
+        Ok(false) => return StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {}
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to evaluate replication version: {error}"),
+            );
+        }
+    }
+
+    if kind == ArtifactKind::Keyvalue {
+        let bytes = match to_bytes(request.into_body(), state.config.max_keyvalue_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                state
+                    .metrics
+                    .record_memory_action("keyvalue_payload_rejected");
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Failed to read replication body: {error}"),
+                );
+            }
+        };
+
+        return match state
+            .store
+            .apply_replicated_artifact_from_bytes(
+                kind,
+                &query.namespace_id,
+                &query.key,
+                &query.content_type,
+                &bytes,
+                query.version_ms,
+            )
+            .await
+        {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist replicated artifact: {error}"),
+            ),
+        };
+    }
+
+    let temp = match read_request_to_temp(
+        request,
+        &state.config.tmp_dir.join("uploads"),
+        u64::MAX,
+        &state.io,
+    )
+    .await
     {
         Ok(temp) => temp,
         Err(BodyReadError::TooLarge) => {
@@ -635,13 +748,18 @@ async fn internal_replicate_artifact(
         }
     };
 
-    match state.store.persist_artifact_from_path(
-        kind,
-        &query.namespace_id,
-        &query.key,
-        &query.content_type,
-        &temp.path,
-    ) {
+    match state
+        .store
+        .apply_replicated_artifact_from_path(
+            kind,
+            &query.namespace_id,
+            &query.key,
+            &query.content_type,
+            &temp.path,
+            query.version_ms,
+        )
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -658,9 +776,18 @@ async fn internal_delete_namespace(
         Ok(namespace_id) => namespace_id,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
+    let version_ms = match optional_u64_param(&params, "version_ms") {
+        Ok(Some(version_ms)) => version_ms,
+        Ok(None) => 0,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
 
-    match state.store.delete_namespace(&namespace_id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match state
+        .store
+        .apply_replicated_namespace_delete(&namespace_id, version_ms)
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to delete replicated namespace: {error}"),
@@ -674,12 +801,12 @@ async fn get_artifact(
     namespace_id: &str,
     key: &str,
 ) -> Response {
-    match state.store.fetch_artifact(kind, namespace_id, key) {
+    match state.store.fetch_artifact(kind, namespace_id, key).await {
         Ok(Some(manifest)) => {
             state
                 .metrics
                 .record_artifact_read(kind, "ok", manifest.size);
-            serve_file(StatusCode::OK, &manifest).await
+            serve_file(&state, StatusCode::OK, &manifest).await
         }
         Ok(None) => {
             state.metrics.record_artifact_read(kind, "not_found", 0);
@@ -704,7 +831,7 @@ async fn put_blob_artifact(
     max_bytes: u64,
     success_status: StatusCode,
 ) -> Response {
-    match state.store.artifact_exists(kind, namespace_id, key) {
+    match state.store.artifact_exists(kind, namespace_id, key).await {
         Ok(true) => return success_status.into_response(),
         Ok(false) => {}
         Err(error) => {
@@ -715,8 +842,13 @@ async fn put_blob_artifact(
         }
     }
 
-    let temp = match read_request_to_temp(request, &state.config.tmp_dir.join("uploads"), max_bytes)
-        .await
+    let temp = match read_request_to_temp(
+        request,
+        &state.config.tmp_dir.join("uploads"),
+        max_bytes,
+        &state.io,
+    )
+    .await
     {
         Ok(temp) => temp,
         Err(BodyReadError::TooLarge) => {
@@ -733,13 +865,17 @@ async fn put_blob_artifact(
         }
     };
 
-    match state.store.persist_artifact_from_path(
-        kind,
-        namespace_id,
-        key,
-        "application/octet-stream",
-        &temp.path,
-    ) {
+    match state
+        .store
+        .persist_artifact_from_path(
+            kind,
+            namespace_id,
+            key,
+            "application/octet-stream",
+            &temp.path,
+        )
+        .await
+    {
         Ok(manifest) => {
             enqueue_replication_for_artifact(&state, &manifest);
             state
@@ -757,10 +893,14 @@ async fn put_blob_artifact(
     }
 }
 
-async fn serve_file(status: StatusCode, manifest: &ArtifactManifest) -> Response {
-    match fs::File::open(&manifest.blob_path).await {
-        Ok(file) => {
-            let stream = ReaderStream::new(file);
+async fn serve_file(
+    state: &SharedState,
+    status: StatusCode,
+    manifest: &ArtifactManifest,
+) -> Response {
+    match state.store.open_artifact_reader(manifest).await {
+        Ok(reader) => {
+            let stream = ReaderStream::new(reader);
             let mut response = Response::new(Body::from_stream(stream));
             *response.status_mut() = status;
             response.headers_mut().insert(
@@ -772,7 +912,7 @@ async fn serve_file(status: StatusCode, manifest: &ArtifactManifest) -> Response
         }
         Err(error) => error_response(
             StatusCode::NOT_FOUND,
-            format!("Artifact blob is missing from local disk: {error}"),
+            format!("Artifact bytes are missing from local storage: {error}"),
         ),
     }
 }
@@ -977,6 +1117,7 @@ mod tests {
                 "application/octet-stream",
                 b"xcode-binary",
             )
+            .await
             .expect("failed to seed store");
 
         let app = router(context.state.clone());

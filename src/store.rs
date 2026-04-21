@@ -1,60 +1,123 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex},
 };
 
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch};
+use bytes::Bytes;
+use futures_util::stream;
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
+};
+use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use crate::{
-    artifact::{kind::ArtifactKind, manifest::ArtifactManifest},
+    artifact::{
+        kind::ArtifactKind, manifest::ArtifactManifest,
+        segment_location_record::SegmentLocationRecord,
+    },
     config::Config,
     constants::{
-        MAX_MODULE_TOTAL_BYTES, ROCKSDB_CF_MANIFESTS, ROCKSDB_CF_MULTIPART_UPLOADS,
-        ROCKSDB_CF_NAMESPACE_ARTIFACTS, ROCKSDB_CF_OUTBOX,
+        DESIRED_CURRENT_SEGMENTS, DESIRED_NEW_SEGMENTS, DESIRED_OLD_SEGMENTS,
+        MAX_MODULE_TOTAL_BYTES, MAX_SEGMENT_BYTES, ROCKSDB_BYTES_PER_SYNC, ROCKSDB_CF_KEYVALUE,
+        ROCKSDB_CF_MANIFESTS, ROCKSDB_CF_MULTIPART_UPLOADS, ROCKSDB_CF_NAMESPACE_ARTIFACTS,
+        ROCKSDB_CF_NAMESPACE_TOMBSTONES, ROCKSDB_CF_OUTBOX, ROCKSDB_CF_SEGMENT_ARTIFACTS,
+        ROCKSDB_CF_SEGMENT_STATE, ROCKSDB_WAL_BYTES_PER_SYNC,
     },
+    io::{IoController, PersistentFile},
+    memory::MemoryController,
     multipart::{error::MultipartError, part::MultipartPart, upload::MultipartUpload},
     replication::outbox_message::OutboxMessage,
+    segment::{
+        generation::SegmentGeneration, reader::SegmentReader, reference::SegmentReference,
+        state::SegmentState,
+    },
     utils::{
         artifact_storage_id, blob_path, module_key, namespace_artifact_index_key, now_ms,
-        temp_file_path,
+        segment_artifact_index_key, segment_artifact_index_prefix, segment_path, temp_file_path,
     },
 };
 
 pub struct Store {
     db: DB,
+    io: IoController,
+    memory: MemoryController,
     tenant_id: String,
     tmp_dir: PathBuf,
     data_dir: PathBuf,
+    segment_write_lock: Mutex<()>,
+    segment_refresh_lock: Mutex<()>,
+    segment_handles: Mutex<SegmentHandleCache>,
+    manifest_cache: StdMutex<ManifestCache>,
+}
+
+pub struct StoreSnapshot {
+    pub outbox_messages: usize,
+    pub multipart_uploads: usize,
+    pub segment_counts: Vec<(ArtifactKind, &'static str, usize)>,
 }
 
 impl Store {
-    pub fn open(config: &Config) -> Result<Self, String> {
+    pub fn open(
+        config: &Config,
+        io: IoController,
+        memory: MemoryController,
+    ) -> Result<Self, String> {
+        let rebuild_started = std::time::Instant::now();
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        options.set_max_open_files(config.rocksdb_max_open_files);
+        options.set_max_background_jobs(config.rocksdb_max_background_jobs);
+        options.set_bytes_per_sync(ROCKSDB_BYTES_PER_SYNC);
+        options.set_wal_bytes_per_sync(ROCKSDB_WAL_BYTES_PER_SYNC);
 
         let cfs = vec![
             ColumnFamilyDescriptor::new(ROCKSDB_CF_MANIFESTS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_KEYVALUE, Options::default()),
             ColumnFamilyDescriptor::new(ROCKSDB_CF_NAMESPACE_ARTIFACTS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_NAMESPACE_TOMBSTONES, Options::default()),
             ColumnFamilyDescriptor::new(ROCKSDB_CF_MULTIPART_UPLOADS, Options::default()),
             ColumnFamilyDescriptor::new(ROCKSDB_CF_OUTBOX, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_SEGMENT_ARTIFACTS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_SEGMENT_STATE, Options::default()),
         ];
 
         let db_path = config.data_dir.join("rocksdb");
         let db = DB::open_cf_descriptors(&options, db_path, cfs)
             .map_err(|error| format!("failed to open RocksDB: {error}"))?;
+        io.metrics()
+            .update_manifest_cache_capacity_bytes(config.manifest_cache_max_bytes);
+        io.metrics().update_manifest_index_entries(0);
+        io.metrics().update_manifest_cache_bytes(0);
+        io.metrics()
+            .record_manifest_index_rebuild("ok", rebuild_started.elapsed());
+        io.metrics()
+            .update_segment_handle_cache_capacity(config.segment_handle_cache_size);
+        io.metrics().update_segment_handles_cached(0);
 
         Ok(Self {
             db,
+            io,
+            memory,
             tenant_id: config.tenant_id.clone(),
             tmp_dir: config.tmp_dir.clone(),
             data_dir: config.data_dir.clone(),
+            segment_write_lock: Mutex::new(()),
+            segment_refresh_lock: Mutex::new(()),
+            segment_handles: Mutex::new(SegmentHandleCache::new(config.segment_handle_cache_size)),
+            manifest_cache: StdMutex::new(ManifestCache::new(config.manifest_cache_max_bytes)),
         })
     }
 
-    pub fn artifact_exists(
+    pub async fn artifact_exists(
         &self,
         kind: ArtifactKind,
         namespace_id: &str,
@@ -62,25 +125,26 @@ impl Store {
     ) -> Result<bool, String> {
         let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
         match self.manifest(&artifact_id)? {
-            Some(manifest) => Ok(Path::new(&manifest.blob_path).exists()),
+            Some(manifest) => self.storage_exists(&manifest).await,
             None => Ok(false),
         }
     }
 
     pub fn manifest(&self, artifact_id: &str) -> Result<Option<ArtifactManifest>, String> {
-        let raw = self
-            .db
-            .get_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes())
-            .map_err(|error| format!("failed to read manifest: {error}"))?;
+        if let Some(manifest) = self.manifest_cache_get(artifact_id) {
+            self.io.metrics().record_manifest_cache_lookup("hit");
+            return Ok(Some(manifest));
+        }
 
-        raw.map(|bytes| {
-            serde_json::from_slice(&bytes)
-                .map_err(|error| format!("failed to decode manifest: {error}"))
-        })
-        .transpose()
+        self.io.metrics().record_manifest_cache_lookup("miss");
+        let manifest = self.manifest_from_db(artifact_id)?;
+        if let Some(manifest) = &manifest {
+            self.maybe_cache_manifest(manifest.clone());
+        }
+        Ok(manifest)
     }
 
-    pub fn fetch_artifact(
+    pub async fn fetch_artifact(
         &self,
         kind: ArtifactKind,
         namespace_id: &str,
@@ -88,13 +152,15 @@ impl Store {
     ) -> Result<Option<ArtifactManifest>, String> {
         let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
         match self.manifest(&artifact_id)? {
-            Some(manifest) if Path::new(&manifest.blob_path).exists() => Ok(Some(manifest)),
+            Some(manifest) if self.storage_exists(&manifest).await? => {
+                self.maybe_refresh_manifest(manifest).await
+            }
             Some(_) => Ok(None),
             None => Ok(None),
         }
     }
 
-    pub fn persist_artifact_from_path(
+    pub async fn persist_artifact_from_path(
         &self,
         kind: ArtifactKind,
         namespace_id: &str,
@@ -102,41 +168,143 @@ impl Store {
         content_type: &str,
         source_path: &Path,
     ) -> Result<ArtifactManifest, String> {
-        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
-        let destination = blob_path(&self.data_dir, kind, &artifact_id);
-        let parent = destination
-            .parent()
-            .ok_or_else(|| "missing blob parent directory".to_string())?;
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create blob dir: {error}"))?;
+        let version_ms = now_ms();
+        self.persist_artifact_from_path_with_version(
+            kind,
+            namespace_id,
+            key,
+            content_type,
+            source_path,
+            version_ms,
+        )
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "artifact write for {kind:?}/{namespace_id}/{key} was rejected by a newer tombstone"
+            )
+        })
+    }
 
-        let size = std::fs::metadata(source_path)
-            .map_err(|error| format!("failed to stat source blob: {error}"))?
-            .len();
+    pub async fn apply_replicated_artifact_from_path(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        source_path: &Path,
+        version_ms: u64,
+    ) -> Result<bool, String> {
+        Ok(self
+            .persist_artifact_from_path_with_version(
+                kind,
+                namespace_id,
+                key,
+                content_type,
+                source_path,
+                version_ms,
+            )
+            .await?
+            .is_some())
+    }
 
-        if destination.exists() {
-            let _ = std::fs::remove_file(source_path);
-        } else if let Err(rename_error) = std::fs::rename(source_path, &destination) {
-            std::fs::copy(source_path, &destination).map_err(|error| {
-                format!("failed to copy blob after rename error ({rename_error}): {error}")
-            })?;
-            let _ = std::fs::remove_file(source_path);
+    async fn persist_artifact_from_path_with_version(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        source_path: &Path,
+        version_ms: u64,
+    ) -> Result<Option<ArtifactManifest>, String> {
+        if kind == ArtifactKind::Keyvalue {
+            let bytes = self.io.read(source_path).await?;
+            self.io.remove_file_if_exists(source_path).await;
+            return self
+                .persist_keyvalue_artifact_with_version(
+                    namespace_id,
+                    key,
+                    content_type,
+                    &bytes,
+                    version_ms,
+                )
+                .await;
         }
+
+        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
+        let size = self.io.metadata_len(source_path).await?;
+
+        let existing = self.manifest_from_db(&artifact_id)?;
+        if let Some(existing) = &existing {
+            if self.storage_exists(&existing).await? {
+                if manifest_version_ms(existing) >= version_ms || version_ms == 0 {
+                    self.io.remove_file_if_exists(source_path).await;
+                    return Ok(Some(existing.clone()));
+                }
+            }
+        }
+        if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
+            self.io.remove_file_if_exists(source_path).await;
+            return Ok(None);
+        }
+
+        let persisted_version_ms = persisted_version_ms(version_ms);
+        let (blob_path, segment_id, segment_offset, evicted_segments) = if kind
+            .uses_segment_storage()
+        {
+            let (location, evicted_segments) =
+                self.append_to_segment(kind, source_path, size).await?;
+            (
+                None,
+                Some(location.segment_id),
+                Some(location.offset),
+                evicted_segments,
+            )
+        } else {
+            let destination = blob_path(&self.data_dir, kind, &artifact_id);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| "missing blob parent directory".to_string())?;
+            self.io.create_dir_all(parent).await?;
+
+            if self.io.path_exists(&destination).await? {
+                self.io.remove_file_if_exists(source_path).await;
+            } else if let Err(rename_error) = self.io.rename(source_path, &destination).await {
+                self.io
+                    .copy(source_path, &destination)
+                    .await
+                    .map_err(|error| {
+                        format!("failed to copy blob after rename error ({rename_error}): {error}")
+                    })?;
+                self.io.remove_file_if_exists(source_path).await;
+            }
+
+            (
+                Some(destination.to_string_lossy().into_owned()),
+                None,
+                None,
+                Vec::new(),
+            )
+        };
 
         let manifest = ArtifactManifest {
             artifact_id: artifact_id.clone(),
             kind,
+            client: kind.client(),
+            artifact_class: kind.artifact_class(),
             namespace_id: namespace_id.to_owned(),
             key: key.to_owned(),
             content_type: content_type.to_owned(),
-            blob_path: destination.to_string_lossy().into_owned(),
+            blob_path,
+            segment_id,
+            segment_offset,
             size,
-            created_at_ms: now_ms(),
+            version_ms: persisted_version_ms,
+            created_at_ms: persisted_version_ms,
         };
+        let metadata = manifest.metadata(&self.tenant_id);
 
         let mut batch = WriteBatch::default();
-        let manifest_bytes = serde_json::to_vec(&manifest)
-            .map_err(|error| format!("failed to encode manifest: {error}"))?;
+        let manifest_bytes = encode_manifest_record(&manifest)?;
         batch.put_cf(
             self.cf(ROCKSDB_CF_MANIFESTS),
             artifact_id.as_bytes(),
@@ -144,18 +312,524 @@ impl Store {
         );
         batch.put_cf(
             self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS),
-            namespace_artifact_index_key(namespace_id, &artifact_id).as_bytes(),
+            namespace_artifact_index_key(&metadata.namespace_id, &artifact_id).as_bytes(),
+            [],
+        );
+        if let Some(previous_manifest) = &existing {
+            if let Some(previous_segment_id) = &previous_manifest.segment_id {
+                if manifest.segment_id.as_deref() != Some(previous_segment_id.as_str()) {
+                    batch.delete_cf(
+                        self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+                        segment_artifact_index_key(kind, previous_segment_id, &artifact_id)
+                            .as_bytes(),
+                    );
+                }
+            }
+        }
+        if let Some(segment_id) = &manifest.segment_id {
+            batch.put_cf(
+                self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+                segment_artifact_index_key(kind, segment_id, &artifact_id).as_bytes(),
+                [],
+            );
+        }
+
+        self.write_batch_sync(batch, "manifest batch")?;
+        self.maybe_cache_manifest(manifest.clone());
+
+        self.evict_segments(kind, evicted_segments).await?;
+
+        Ok(Some(manifest))
+    }
+
+    pub async fn open_artifact_reader(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+        self.open_manifest_reader(manifest).await
+    }
+
+    async fn open_manifest_reader(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+        if manifest.kind == ArtifactKind::Keyvalue {
+            if let Some(bytes) = self.keyvalue_bytes(&manifest.artifact_id)? {
+                let stream =
+                    stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(bytes)) });
+                return Ok(Box::pin(StreamReader::new(stream)));
+            }
+        }
+
+        if let Some(segment_id) = &manifest.segment_id {
+            let offset = manifest
+                .segment_offset
+                .ok_or_else(|| "segment-backed manifest is missing segment offset".to_string())?;
+            let handle = self.segment_handle(manifest.kind, segment_id).await?;
+            return Ok(Box::pin(SegmentReader::new(handle, offset, manifest.size)));
+        }
+
+        if let Some(blob_path) = &manifest.blob_path {
+            let file = self
+                .io
+                .open_file(Path::new(blob_path))
+                .await
+                .map_err(|error| format!("failed to open blob {blob_path} for read: {error}"))?;
+            return Ok(Box::pin(file.take(manifest.size)));
+        }
+
+        Err("manifest does not have a readable storage location".to_string())
+    }
+
+    async fn maybe_refresh_manifest(
+        &self,
+        manifest: ArtifactManifest,
+    ) -> Result<Option<ArtifactManifest>, String> {
+        if !self.memory.allow_segment_refresh() {
+            self.io
+                .metrics()
+                .record_memory_action("segment_refresh_skipped");
+            return Ok(Some(manifest));
+        }
+        let Some(segment_id) = manifest.segment_id.as_deref() else {
+            return Ok(Some(manifest));
+        };
+        if self.segment_generation(manifest.kind, segment_id)? != Some(SegmentGeneration::Old) {
+            return Ok(Some(manifest));
+        }
+
+        let refresh_started = std::time::Instant::now();
+        let _guard = self.segment_refresh_lock.lock().await;
+        let Some(current) = self.manifest(&manifest.artifact_id)? else {
+            return Ok(None);
+        };
+        let Some(current_segment_id) = current.segment_id.as_deref() else {
+            return Ok(Some(current));
+        };
+        if self.segment_generation(current.kind, current_segment_id)?
+            != Some(SegmentGeneration::Old)
+        {
+            return Ok(Some(current));
+        }
+        if !self.storage_exists(&current).await? {
+            return Ok(None);
+        }
+
+        let mut reader = self.open_manifest_reader(&current).await?;
+        let (location, evicted_segments) = self
+            .append_reader_to_segment(current.kind, &mut reader, current.size)
+            .await?;
+        let mut refreshed = current.clone();
+        let previous_segment_id = current_segment_id.to_owned();
+        refreshed.blob_path = None;
+        refreshed.segment_id = Some(location.segment_id.clone());
+        refreshed.segment_offset = Some(location.offset);
+
+        let mut batch = WriteBatch::default();
+        let manifest_bytes = encode_manifest_record(&refreshed)?;
+        batch.put_cf(
+            self.cf(ROCKSDB_CF_MANIFESTS),
+            refreshed.artifact_id.as_bytes(),
+            manifest_bytes,
+        );
+        batch.delete_cf(
+            self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+            segment_artifact_index_key(current.kind, &previous_segment_id, &current.artifact_id)
+                .as_bytes(),
+        );
+        batch.put_cf(
+            self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+            segment_artifact_index_key(current.kind, &location.segment_id, &current.artifact_id)
+                .as_bytes(),
+            [],
+        );
+        self.write_batch_sync(batch, "refreshed manifest")?;
+        self.maybe_cache_manifest(refreshed.clone());
+
+        self.io.metrics().record_segment_refresh(
+            current.kind,
+            "ok",
+            current.size,
+            refresh_started.elapsed(),
+        );
+        self.evict_segments(current.kind, evicted_segments).await?;
+
+        Ok(Some(refreshed))
+    }
+
+    async fn storage_exists(&self, manifest: &ArtifactManifest) -> Result<bool, String> {
+        if manifest.kind == ArtifactKind::Keyvalue {
+            if self.keyvalue_bytes(&manifest.artifact_id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        if manifest.is_segment_backed() {
+            let segment_id = manifest
+                .segment_id
+                .as_ref()
+                .expect("segment-backed manifest should have a segment id");
+            return self
+                .io
+                .path_exists(&self.segment_path(manifest.kind, segment_id))
+                .await;
+        }
+        if let Some(blob_path) = &manifest.blob_path {
+            return self.io.path_exists(Path::new(blob_path)).await;
+        }
+        Ok(false)
+    }
+
+    async fn persist_keyvalue_artifact_with_version(
+        &self,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        bytes: &[u8],
+        version_ms: u64,
+    ) -> Result<Option<ArtifactManifest>, String> {
+        let artifact_id =
+            artifact_storage_id(ArtifactKind::Keyvalue, &self.tenant_id, namespace_id, key);
+
+        let existing = self.manifest_from_db(&artifact_id)?;
+        if let Some(existing) = &existing {
+            if existing.kind == ArtifactKind::Keyvalue
+                && self.keyvalue_bytes(&artifact_id)?.is_some()
+                && existing.blob_path.is_none()
+            {
+                if manifest_version_ms(existing) >= version_ms || version_ms == 0 {
+                    return Ok(Some(existing.clone()));
+                }
+            }
+        }
+        if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
+            return Ok(None);
+        }
+
+        let persisted_version_ms = persisted_version_ms(version_ms);
+
+        let manifest = ArtifactManifest {
+            artifact_id: artifact_id.clone(),
+            kind: ArtifactKind::Keyvalue,
+            client: ArtifactKind::Keyvalue.client(),
+            artifact_class: ArtifactKind::Keyvalue.artifact_class(),
+            namespace_id: namespace_id.to_owned(),
+            key: key.to_owned(),
+            content_type: content_type.to_owned(),
+            blob_path: None,
+            segment_id: None,
+            segment_offset: None,
+            size: bytes.len() as u64,
+            version_ms: persisted_version_ms,
+            created_at_ms: persisted_version_ms,
+        };
+        let metadata = manifest.metadata(&self.tenant_id);
+
+        let mut batch = WriteBatch::default();
+        let manifest_bytes = encode_manifest_record(&manifest)?;
+        batch.put_cf(
+            self.cf(ROCKSDB_CF_MANIFESTS),
+            artifact_id.as_bytes(),
+            manifest_bytes,
+        );
+        batch.put_cf(self.cf(ROCKSDB_CF_KEYVALUE), artifact_id.as_bytes(), bytes);
+        batch.put_cf(
+            self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS),
+            namespace_artifact_index_key(&metadata.namespace_id, &artifact_id).as_bytes(),
             [],
         );
 
-        self.db
-            .write(batch)
-            .map_err(|error| format!("failed to write manifest batch: {error}"))?;
+        self.write_batch_sync(batch, "keyvalue batch")?;
+        self.maybe_cache_manifest(manifest.clone());
 
-        Ok(manifest)
+        Ok(Some(manifest))
     }
 
-    pub fn persist_artifact_from_bytes(
+    fn keyvalue_bytes(&self, artifact_id: &str) -> Result<Option<Vec<u8>>, String> {
+        self.db
+            .get_cf(self.cf(ROCKSDB_CF_KEYVALUE), artifact_id.as_bytes())
+            .map_err(|error| format!("failed to read keyvalue bytes: {error}"))
+    }
+
+    async fn append_to_segment(
+        &self,
+        kind: ArtifactKind,
+        source_path: &Path,
+        size: u64,
+    ) -> Result<(SegmentLocation, Vec<SegmentReference>), String> {
+        let mut source = self.io.open_file(source_path).await?;
+        let result = self.append_reader_to_segment(kind, &mut source, size).await;
+        self.io.remove_file_if_exists(source_path).await;
+        result
+    }
+
+    async fn append_reader_to_segment<R>(
+        &self,
+        kind: ArtifactKind,
+        source: &mut R,
+        size: u64,
+    ) -> Result<(SegmentLocation, Vec<SegmentReference>), String>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let _guard = self.segment_write_lock.lock().await;
+        let (segment, evicted_segments) = self.active_segment(kind, size).await?;
+        let segment_path = self.segment_path(kind, &segment.segment_id);
+        let segment_dir = segment_path
+            .parent()
+            .ok_or_else(|| "missing segment parent directory".to_string())?;
+        self.io.create_dir_all(segment_dir).await?;
+
+        let segment_already_exists = self.io.path_exists(&segment_path).await?;
+        let offset = if segment_already_exists {
+            self.io.metadata_len(&segment_path).await?
+        } else {
+            0
+        };
+
+        let mut destination = self.io.open_append_file(&segment_path).await?;
+        let copied = tokio::io::copy(source, &mut destination)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to append into segment {}: {error}",
+                    segment_path.display()
+                )
+            })?;
+        if copied != size {
+            return Err(format!(
+                "appended {copied} bytes into segment {}, expected {size}",
+                segment_path.display()
+            ));
+        }
+        destination.flush().await.map_err(|error| {
+            format!(
+                "failed to flush segment {}: {error}",
+                segment_path.display()
+            )
+        })?;
+        destination.sync_data().await.map_err(|error| {
+            format!("failed to sync segment {}: {error}", segment_path.display())
+        })?;
+        drop(destination);
+        if !segment_already_exists {
+            self.io.sync_directory(segment_dir).await?;
+        }
+
+        Ok((
+            SegmentLocation {
+                segment_id: segment.segment_id,
+                offset,
+            },
+            evicted_segments,
+        ))
+    }
+
+    async fn active_segment(
+        &self,
+        kind: ArtifactKind,
+        incoming_size: u64,
+    ) -> Result<(SegmentReference, Vec<SegmentReference>), String> {
+        let mut state = self.load_segment_state(kind)?;
+        let needs_new_segment = match state.active() {
+            Some(segment) => {
+                let path = self.segment_path(kind, &segment.segment_id);
+                let current_size = if self.io.path_exists(&path).await? {
+                    self.io.metadata_len(&path).await?
+                } else {
+                    0
+                };
+                current_size.saturating_add(incoming_size) > MAX_SEGMENT_BYTES
+            }
+            None => true,
+        };
+
+        if needs_new_segment {
+            let segment = SegmentReference::new(Uuid::now_v7().to_string(), now_ms());
+            let evicted_segments = state.push_new(
+                segment.clone(),
+                DESIRED_OLD_SEGMENTS,
+                DESIRED_CURRENT_SEGMENTS,
+                DESIRED_NEW_SEGMENTS,
+            );
+            self.save_segment_state(kind, &state)?;
+            Ok((segment, evicted_segments))
+        } else {
+            Ok((
+                state
+                    .active()
+                    .cloned()
+                    .expect("current segment should exist when not rotating"),
+                Vec::new(),
+            ))
+        }
+    }
+
+    fn load_segment_state(&self, kind: ArtifactKind) -> Result<SegmentState, String> {
+        let key = kind.as_str().as_bytes();
+        let Some(bytes) = self
+            .db
+            .get_cf(self.cf(ROCKSDB_CF_SEGMENT_STATE), key)
+            .map_err(|error| format!("failed to read segment state: {error}"))?
+        else {
+            return Ok(SegmentState::default());
+        };
+
+        match serde_json::from_slice::<SegmentState>(&bytes) {
+            Ok(state) => Ok(state),
+            Err(_) => {
+                let segment_id = String::from_utf8(bytes.to_vec())
+                    .map_err(|error| format!("segment state is not valid utf-8: {error}"))?;
+                Ok(SegmentState::from_legacy_active(segment_id, now_ms()))
+            }
+        }
+    }
+
+    fn save_segment_state(&self, kind: ArtifactKind, state: &SegmentState) -> Result<(), String> {
+        let bytes = serde_json::to_vec(state)
+            .map_err(|error| format!("failed to encode segment state: {error}"))?;
+        self.db
+            .put_cf(
+                self.cf(ROCKSDB_CF_SEGMENT_STATE),
+                kind.as_str().as_bytes(),
+                bytes,
+            )
+            .map_err(|error| format!("failed to persist segment state: {error}"))
+    }
+
+    fn segment_generation(
+        &self,
+        kind: ArtifactKind,
+        segment_id: &str,
+    ) -> Result<Option<SegmentGeneration>, String> {
+        Ok(self.load_segment_state(kind)?.generation_of(segment_id))
+    }
+
+    async fn evict_segments(
+        &self,
+        kind: ArtifactKind,
+        evicted_segments: Vec<SegmentReference>,
+    ) -> Result<(), String> {
+        for segment in evicted_segments {
+            self.evict_segment(kind, &segment.segment_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn evict_segment(&self, kind: ArtifactKind, segment_id: &str) -> Result<(), String> {
+        let prefix = segment_artifact_index_prefix(kind, segment_id);
+        let mut batch = WriteBatch::default();
+        let mut saw_entries = false;
+        let mut removed_artifacts = 0_u64;
+        let mut removed_artifact_ids = Vec::new();
+        let iter = self.db.iterator_cf(
+            self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        for item in iter {
+            let (index_key, _) =
+                item.map_err(|error| format!("failed to iterate segment index: {error}"))?;
+            if !index_key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            saw_entries = true;
+            let artifact_id = std::str::from_utf8(&index_key[prefix.len()..])
+                .map_err(|error| format!("invalid segment index key: {error}"))?
+                .to_owned();
+
+            match self.manifest_from_db(&artifact_id)? {
+                Some(manifest) if manifest.segment_id.as_deref() == Some(segment_id) => {
+                    batch.delete_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes());
+                    batch.delete_cf(
+                        self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS),
+                        namespace_artifact_index_key(&manifest.namespace_id, &artifact_id)
+                            .as_bytes(),
+                    );
+                    batch.delete_cf(self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS), &index_key);
+                    removed_artifacts += 1;
+                    removed_artifact_ids.push(artifact_id);
+                }
+                Some(_) | None => {
+                    batch.delete_cf(self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS), &index_key);
+                }
+            }
+        }
+
+        if saw_entries {
+            self.db
+                .write(batch)
+                .map_err(|error| format!("failed to evict segment metadata: {error}"))?;
+            self.remove_manifest_cache_keys(&removed_artifact_ids);
+        }
+        self.remove_segment_handle(kind, segment_id).await;
+        self.io
+            .remove_file_if_exists(&self.segment_path(kind, segment_id))
+            .await;
+        let mut state = self.load_segment_state(kind)?;
+        if state.remove_segment(segment_id) {
+            self.save_segment_state(kind, &state)?;
+        }
+        self.io
+            .metrics()
+            .record_segment_eviction(kind, "ok", removed_artifacts);
+
+        Ok(())
+    }
+
+    fn segment_path(&self, kind: ArtifactKind, segment_id: &str) -> PathBuf {
+        segment_path(&self.data_dir, kind, segment_id)
+    }
+
+    async fn segment_handle(
+        &self,
+        kind: ArtifactKind,
+        segment_id: &str,
+    ) -> Result<Arc<PersistentFile>, String> {
+        let cache_key = segment_handle_cache_key(kind, segment_id);
+        if let Some(handle) = self.segment_handle_cache_get(&cache_key).await {
+            self.io.metrics().record_segment_handle_cache_lookup("hit");
+            return Ok(handle);
+        }
+        self.io.metrics().record_segment_handle_cache_lookup("miss");
+
+        let handle = Arc::new(
+            self.io
+                .open_persistent_read_file(&self.segment_path(kind, segment_id))
+                .await?,
+        );
+        let mut cache = self.segment_handles.lock().await;
+        if let Some(existing) = cache.touch(&cache_key) {
+            return Ok(existing);
+        }
+        let evicted = cache.insert(cache_key, handle.clone());
+        let cached = cache.len();
+        drop(cache);
+        self.io.metrics().update_segment_handles_cached(cached);
+        self.io
+            .metrics()
+            .record_segment_handle_evictions("capacity", evicted as u64);
+        Ok(handle)
+    }
+
+    async fn remove_segment_handle(&self, kind: ArtifactKind, segment_id: &str) {
+        let mut cache = self.segment_handles.lock().await;
+        let removed = cache.remove(&segment_handle_cache_key(kind, segment_id));
+        let cached = cache.len();
+        drop(cache);
+        self.io.metrics().update_segment_handles_cached(cached);
+        if removed {
+            self.io
+                .metrics()
+                .record_segment_handle_evictions("segment_eviction", 1);
+        }
+    }
+
+    async fn segment_handle_cache_get(&self, cache_key: &str) -> Option<Arc<PersistentFile>> {
+        let mut cache = self.segment_handles.lock().await;
+        cache.touch(cache_key)
+    }
+
+    pub async fn persist_artifact_from_bytes(
         &self,
         kind: ArtifactKind,
         namespace_id: &str,
@@ -163,16 +837,118 @@ impl Store {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<ArtifactManifest, String> {
-        let temp_path = temp_file_path(&self.tmp_dir.join("uploads"), "replication");
-        std::fs::write(&temp_path, bytes)
-            .map_err(|error| format!("failed to write temp blob: {error}"))?;
-        self.persist_artifact_from_path(kind, namespace_id, key, content_type, &temp_path)
+        let version_ms = now_ms();
+        self.persist_artifact_from_bytes_with_version(
+            kind,
+            namespace_id,
+            key,
+            content_type,
+            bytes,
+            version_ms,
+        )
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "artifact write for {kind:?}/{namespace_id}/{key} was rejected by a newer tombstone"
+            )
+        })
     }
 
-    pub fn delete_namespace(&self, namespace_id: &str) -> Result<(), String> {
+    pub async fn apply_replicated_artifact_from_bytes(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        bytes: &[u8],
+        version_ms: u64,
+    ) -> Result<bool, String> {
+        Ok(self
+            .persist_artifact_from_bytes_with_version(
+                kind,
+                namespace_id,
+                key,
+                content_type,
+                bytes,
+                version_ms,
+            )
+            .await?
+            .is_some())
+    }
+
+    async fn persist_artifact_from_bytes_with_version(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        bytes: &[u8],
+        version_ms: u64,
+    ) -> Result<Option<ArtifactManifest>, String> {
+        if kind == ArtifactKind::Keyvalue {
+            return self
+                .persist_keyvalue_artifact_with_version(
+                    namespace_id,
+                    key,
+                    content_type,
+                    bytes,
+                    version_ms,
+                )
+                .await;
+        }
+
+        let temp_path = temp_file_path(&self.tmp_dir.join("uploads"), "replication");
+        self.io.write(&temp_path, bytes).await?;
+        self.persist_artifact_from_path_with_version(
+            kind,
+            namespace_id,
+            key,
+            content_type,
+            &temp_path,
+            version_ms,
+        )
+        .await
+    }
+
+    pub async fn delete_namespace(&self, namespace_id: &str) -> Result<u64, String> {
+        let version_ms = now_ms();
+        self.delete_namespace_with_version(namespace_id, version_ms)
+            .await
+            .map(|_| version_ms)
+    }
+
+    pub async fn apply_replicated_namespace_delete(
+        &self,
+        namespace_id: &str,
+        version_ms: u64,
+    ) -> Result<bool, String> {
+        self.delete_namespace_with_version(namespace_id, version_ms)
+            .await
+    }
+
+    async fn delete_namespace_with_version(
+        &self,
+        namespace_id: &str,
+        version_ms: u64,
+    ) -> Result<bool, String> {
         let prefix = format!("{namespace_id}\0");
         let mut batch = WriteBatch::default();
         let mut blob_paths = Vec::new();
+        let mut removed_artifact_ids = Vec::new();
+        let delete_everything = version_ms == 0;
+
+        if !delete_everything {
+            if let Some(current_tombstone) = self.namespace_tombstone_version(namespace_id)? {
+                if current_tombstone >= version_ms {
+                    return Ok(false);
+                }
+            }
+            batch.put_cf(
+                self.cf(ROCKSDB_CF_NAMESPACE_TOMBSTONES),
+                namespace_id.as_bytes(),
+                version_ms.to_le_bytes(),
+            );
+        }
 
         let iter = self.db.iterator_cf(
             self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS),
@@ -190,23 +966,38 @@ impl Store {
                 .map_err(|error| format!("invalid namespace index key: {error}"))?
                 .to_owned();
 
-            if let Some(manifest) = self.manifest(&artifact_id)? {
-                blob_paths.push(PathBuf::from(manifest.blob_path));
+            if let Some(manifest) = self.manifest_from_db(&artifact_id)? {
+                if !delete_everything && manifest_version_ms(&manifest) > version_ms {
+                    continue;
+                }
+                if manifest.kind == ArtifactKind::Keyvalue {
+                    batch.delete_cf(self.cf(ROCKSDB_CF_KEYVALUE), artifact_id.as_bytes());
+                }
+                if let Some(blob_path) = manifest.blob_path {
+                    blob_paths.push(PathBuf::from(blob_path));
+                }
+                if let Some(segment_id) = manifest.segment_id {
+                    batch.delete_cf(
+                        self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+                        segment_artifact_index_key(manifest.kind, &segment_id, &artifact_id)
+                            .as_bytes(),
+                    );
+                }
             }
 
             batch.delete_cf(self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS), index_key);
             batch.delete_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes());
+            removed_artifact_ids.push(artifact_id);
         }
 
-        self.db
-            .write(batch)
-            .map_err(|error| format!("failed to delete namespace batch: {error}"))?;
+        self.write_batch_sync(batch, "delete namespace batch")?;
+        self.remove_manifest_cache_keys(&removed_artifact_ids);
 
         for path in blob_paths {
-            let _ = std::fs::remove_file(path);
+            self.io.remove_file_if_exists(&path).await;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn start_multipart_upload(
@@ -255,7 +1046,7 @@ impl Store {
         .transpose()
     }
 
-    pub fn add_multipart_part(
+    pub async fn add_multipart_part(
         &self,
         upload_id: &str,
         part_number: u32,
@@ -271,18 +1062,18 @@ impl Store {
         validate_total_size(next_total, MAX_MODULE_TOTAL_BYTES)?;
 
         let upload_dir = self.data_dir.join("multipart").join(upload_id);
-        std::fs::create_dir_all(&upload_dir).map_err(|error| {
+        self.io.create_dir_all(&upload_dir).await.map_err(|error| {
             MultipartError::Other(format!("failed to create multipart dir: {error}"))
         })?;
         let final_path = upload_dir.join(part_number.to_string());
 
-        if let Err(rename_error) = std::fs::rename(part_path, &final_path) {
-            std::fs::copy(part_path, &final_path).map_err(|error| {
+        if let Err(rename_error) = self.io.rename(part_path, &final_path).await {
+            self.io.copy(part_path, &final_path).await.map_err(|error| {
                 MultipartError::Other(format!(
                     "failed to store multipart part after rename error ({rename_error}): {error}"
                 ))
             })?;
-            let _ = std::fs::remove_file(part_path);
+            self.io.remove_file_if_exists(part_path).await;
         }
 
         upload.parts.insert(
@@ -309,7 +1100,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn complete_multipart_upload(
+    pub async fn complete_multipart_upload(
         &self,
         upload_id: &str,
         expected_parts: &[u32],
@@ -325,23 +1116,29 @@ impl Store {
         }
 
         let assembled_path = temp_file_path(&self.tmp_dir.join("uploads"), "module");
-        let mut assembled = std::fs::File::create(&assembled_path).map_err(|error| {
-            MultipartError::Other(format!("failed to create assembled artifact: {error}"))
-        })?;
+        let mut assembled = self
+            .io
+            .create_file(&assembled_path)
+            .await
+            .map_err(MultipartError::Other)?;
 
         for part_number in expected_parts {
             let part = upload
                 .parts
                 .get(part_number)
                 .ok_or(MultipartError::PartsMismatch)?;
-            let bytes = std::fs::read(&part.path).map_err(|error| {
-                MultipartError::Other(format!("failed to read multipart part: {error}"))
-            })?;
-            use std::io::Write;
-            assembled.write_all(&bytes).map_err(|error| {
+            let bytes = self
+                .io
+                .read(Path::new(&part.path))
+                .await
+                .map_err(MultipartError::Other)?;
+            assembled.write_all(&bytes).await.map_err(|error| {
                 MultipartError::Other(format!("failed to assemble multipart artifact: {error}"))
             })?;
         }
+        assembled.flush().await.map_err(|error| {
+            MultipartError::Other(format!("failed to flush assembled artifact: {error}"))
+        })?;
 
         let key = module_key(&upload.category, &upload.hash, &upload.name);
         let manifest = self
@@ -352,23 +1149,27 @@ impl Store {
                 "application/octet-stream",
                 &assembled_path,
             )
+            .await
             .map_err(MultipartError::Other)?;
 
         self.abort_multipart_upload(upload_id)
+            .await
             .map_err(MultipartError::Other)?;
 
         Ok(manifest)
     }
 
-    pub fn abort_multipart_upload(&self, upload_id: &str) -> Result<(), String> {
+    pub async fn abort_multipart_upload(&self, upload_id: &str) -> Result<(), String> {
         if let Some(upload) = self.multipart_upload(upload_id)? {
-            let _ = std::fs::remove_dir_all(self.data_dir.join("multipart").join(upload_id));
+            self.io
+                .remove_dir_all_if_exists(&self.data_dir.join("multipart").join(upload_id))
+                .await;
             self.db
                 .delete_cf(self.cf(ROCKSDB_CF_MULTIPART_UPLOADS), upload_id.as_bytes())
                 .map_err(|error| format!("failed to delete multipart upload: {error}"))?;
 
             for part in upload.parts.values() {
-                let _ = std::fs::remove_file(&part.path);
+                self.io.remove_file_if_exists(Path::new(&part.path)).await;
             }
         }
 
@@ -379,9 +1180,9 @@ impl Store {
         let key = format!("{:020}-{}", now_ms(), Uuid::now_v7());
         let value = serde_json::to_vec(&message)
             .map_err(|error| format!("failed to encode outbox message: {error}"))?;
-        self.db
-            .put_cf(self.cf(ROCKSDB_CF_OUTBOX), key.as_bytes(), value)
-            .map_err(|error| format!("failed to enqueue outbox message: {error}"))
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(ROCKSDB_CF_OUTBOX), key.as_bytes(), value);
+        self.write_batch_sync(batch, "outbox message")
     }
 
     pub fn outbox_messages(&self) -> Result<Vec<(Vec<u8>, OutboxMessage)>, String> {
@@ -399,16 +1200,196 @@ impl Store {
         Ok(messages)
     }
 
+    pub fn snapshot(&self) -> Result<StoreSnapshot, String> {
+        let outbox_messages = self.outbox_messages()?.len();
+        let multipart_uploads = self.count_cf_entries(ROCKSDB_CF_MULTIPART_UPLOADS)?;
+        let mut segment_counts = Vec::new();
+        for kind in ArtifactKind::all() {
+            let state = self.load_segment_state(kind)?;
+            segment_counts.push((kind, "old", state.old.len()));
+            segment_counts.push((kind, "current", state.current.len()));
+            segment_counts.push((kind, "new", state.new.len()));
+        }
+        Ok(StoreSnapshot {
+            outbox_messages,
+            multipart_uploads,
+            segment_counts,
+        })
+    }
+
     pub fn delete_outbox_message(&self, key: &[u8]) -> Result<(), String> {
         self.db
             .delete_cf(self.cf(ROCKSDB_CF_OUTBOX), key)
             .map_err(|error| format!("failed to delete outbox entry: {error}"))
     }
 
+    pub fn artifact_version_is_current(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        version_ms: u64,
+    ) -> Result<bool, String> {
+        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
+        if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
+            return Ok(false);
+        }
+
+        Ok(self
+            .manifest_from_db(&artifact_id)?
+            .map(|manifest| manifest_version_ms(&manifest) < version_ms)
+            .unwrap_or(true))
+    }
+
     fn cf(&self, name: &str) -> &ColumnFamily {
         self.db
             .cf_handle(name)
             .expect("missing RocksDB column family")
+    }
+
+    fn write_batch_sync(&self, batch: WriteBatch, label: &str) -> Result<(), String> {
+        let mut write_options = WriteOptions::default();
+        write_options.set_sync(true);
+        self.db
+            .write_opt(batch, &write_options)
+            .map_err(|error| format!("failed to write {label}: {error}"))
+    }
+
+    fn namespace_tombstone_version(&self, namespace_id: &str) -> Result<Option<u64>, String> {
+        let Some(bytes) = self
+            .db
+            .get_cf(
+                self.cf(ROCKSDB_CF_NAMESPACE_TOMBSTONES),
+                namespace_id.as_bytes(),
+            )
+            .map_err(|error| format!("failed to read namespace tombstone: {error}"))?
+        else {
+            return Ok(None);
+        };
+
+        if bytes.len() != 8 {
+            return Err(format!(
+                "namespace tombstone for {namespace_id} should be 8 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        let mut slice = [0_u8; 8];
+        slice.copy_from_slice(bytes.as_ref());
+        Ok(Some(u64::from_le_bytes(slice)))
+    }
+
+    fn namespace_tombstone_blocks(
+        &self,
+        namespace_id: &str,
+        version_ms: u64,
+    ) -> Result<bool, String> {
+        Ok(self
+            .namespace_tombstone_version(namespace_id)?
+            .map(|tombstone_version_ms| version_ms == 0 || tombstone_version_ms >= version_ms)
+            .unwrap_or(false))
+    }
+
+    fn count_cf_entries(&self, name: &str) -> Result<usize, String> {
+        let iter = self.db.iterator_cf(self.cf(name), IteratorMode::Start);
+        let mut count = 0_usize;
+        for item in iter {
+            item.map_err(|error| format!("failed to iterate {name}: {error}"))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn trim_manifest_cache_to(&self, target_bytes: usize, reason: &str) -> usize {
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .expect("manifest cache lock poisoned");
+        let evicted = cache.trim_to(target_bytes);
+        self.record_manifest_cache_state(&cache);
+        if evicted > 0 {
+            self.io
+                .metrics()
+                .record_manifest_cache_evictions(reason, evicted as u64);
+        }
+        evicted
+    }
+
+    fn manifest_from_db(&self, artifact_id: &str) -> Result<Option<ArtifactManifest>, String> {
+        self.db
+            .get_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes())
+            .map_err(|error| format!("failed to read manifest from RocksDB: {error}"))?
+            .map(|bytes| decode_manifest_record(artifact_id, &bytes))
+            .transpose()
+    }
+
+    fn manifest_cache_get(&self, artifact_id: &str) -> Option<ArtifactManifest> {
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .expect("manifest cache lock poisoned");
+        cache.get(artifact_id)
+    }
+
+    fn maybe_cache_manifest(&self, manifest: ArtifactManifest) {
+        if !self.memory.allow_manifest_cache_admission() {
+            self.io
+                .metrics()
+                .record_manifest_cache_admission("pressure_skipped");
+            self.io
+                .metrics()
+                .record_memory_action("manifest_cache_skip");
+            return;
+        }
+
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .expect("manifest cache lock poisoned");
+        match cache.insert(manifest) {
+            ManifestCacheInsertResult::Admitted { evicted } => {
+                self.io
+                    .metrics()
+                    .record_manifest_cache_admission("admitted");
+                if evicted > 0 {
+                    self.io
+                        .metrics()
+                        .record_manifest_cache_evictions("capacity", evicted as u64);
+                }
+            }
+            ManifestCacheInsertResult::Updated { evicted } => {
+                self.io.metrics().record_manifest_cache_admission("updated");
+                if evicted > 0 {
+                    self.io
+                        .metrics()
+                        .record_manifest_cache_evictions("capacity", evicted as u64);
+                }
+            }
+            ManifestCacheInsertResult::Oversized => self
+                .io
+                .metrics()
+                .record_manifest_cache_admission("oversized"),
+        }
+        self.record_manifest_cache_state(&cache);
+    }
+
+    fn remove_manifest_cache_keys(&self, artifact_ids: &[String]) {
+        if artifact_ids.is_empty() {
+            return;
+        }
+
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .expect("manifest cache lock poisoned");
+        cache.remove_many(artifact_ids);
+        self.record_manifest_cache_state(&cache);
+    }
+
+    fn record_manifest_cache_state(&self, cache: &ManifestCache) {
+        self.io.metrics().update_manifest_index_entries(cache.len());
+        self.io
+            .metrics()
+            .update_manifest_cache_bytes(cache.total_bytes());
     }
 }
 
@@ -426,16 +1407,277 @@ fn validate_total_size(next_total: u64, max_total: u64) -> Result<(), MultipartE
     }
 }
 
+struct ManifestCache {
+    entries: BTreeMap<String, CachedManifest>,
+    total_bytes: usize,
+    next_access_order: u64,
+    max_bytes: usize,
+}
+
+struct CachedManifest {
+    manifest: ArtifactManifest,
+    size_bytes: usize,
+    access_order: u64,
+}
+
+enum ManifestCacheInsertResult {
+    Admitted { evicted: usize },
+    Updated { evicted: usize },
+    Oversized,
+}
+
+impl ManifestCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            total_bytes: 0,
+            next_access_order: 0,
+            max_bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    fn get(&mut self, artifact_id: &str) -> Option<ArtifactManifest> {
+        let access_order = self.next_access_order();
+        self.entries.get_mut(artifact_id).map(|cached| {
+            cached.access_order = access_order;
+            cached.manifest.clone()
+        })
+    }
+
+    fn insert(&mut self, manifest: ArtifactManifest) -> ManifestCacheInsertResult {
+        let artifact_id = manifest.artifact_id.clone();
+        let size_bytes = estimated_manifest_bytes(&manifest);
+        if size_bytes > self.max_bytes {
+            self.entries.remove(&artifact_id);
+            self.recompute_total_bytes();
+            return ManifestCacheInsertResult::Oversized;
+        }
+
+        let existed = self.entries.remove(&artifact_id).is_some();
+        self.recompute_total_bytes();
+        let access_order = self.next_access_order();
+        self.entries.insert(
+            artifact_id,
+            CachedManifest {
+                manifest,
+                size_bytes,
+                access_order,
+            },
+        );
+        self.total_bytes = self.total_bytes.saturating_add(size_bytes);
+        let evicted = self.trim_to(self.max_bytes);
+
+        if existed {
+            ManifestCacheInsertResult::Updated { evicted }
+        } else {
+            ManifestCacheInsertResult::Admitted { evicted }
+        }
+    }
+
+    fn remove_many(&mut self, artifact_ids: &[String]) {
+        for artifact_id in artifact_ids {
+            self.entries.remove(artifact_id);
+        }
+        self.recompute_total_bytes();
+    }
+
+    fn trim_to(&mut self, target_bytes: usize) -> usize {
+        let mut evicted = 0_usize;
+        while self.total_bytes > target_bytes {
+            let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.access_order)
+                .map(|(artifact_id, _)| artifact_id.clone())
+            else {
+                break;
+            };
+            if self.entries.remove(&oldest_key).is_some() {
+                evicted += 1;
+                self.recompute_total_bytes();
+            }
+        }
+        evicted
+    }
+
+    fn recompute_total_bytes(&mut self) {
+        self.total_bytes = self.entries.values().map(|cached| cached.size_bytes).sum();
+    }
+
+    fn next_access_order(&mut self) -> u64 {
+        self.next_access_order = self.next_access_order.wrapping_add(1);
+        self.next_access_order
+    }
+}
+
+fn estimated_manifest_bytes(manifest: &ArtifactManifest) -> usize {
+    let optional_blob_path = manifest.blob_path.as_deref().map(str::len).unwrap_or(0);
+    let optional_segment_id = manifest.segment_id.as_deref().map(str::len).unwrap_or(0);
+    manifest.artifact_id.len()
+        + manifest.namespace_id.len()
+        + manifest.key.len()
+        + manifest.content_type.len()
+        + optional_blob_path
+        + optional_segment_id
+        + std::mem::size_of::<ArtifactManifest>()
+}
+
+struct SegmentLocation {
+    segment_id: String,
+    offset: u64,
+}
+
+struct SegmentHandleCache {
+    entries: BTreeMap<String, CachedSegmentHandle>,
+    next_access_order: u64,
+    capacity: usize,
+}
+
+struct CachedSegmentHandle {
+    handle: Arc<PersistentFile>,
+    access_order: u64,
+}
+
+impl SegmentHandleCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next_access_order: 0,
+            capacity,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn touch(&mut self, cache_key: &str) -> Option<Arc<PersistentFile>> {
+        let access_order = self.next_access_order();
+        self.entries.get_mut(cache_key).map(|entry| {
+            entry.access_order = access_order;
+            entry.handle.clone()
+        })
+    }
+
+    fn insert(&mut self, cache_key: String, handle: Arc<PersistentFile>) -> usize {
+        let access_order = self.next_access_order();
+        self.entries.insert(
+            cache_key,
+            CachedSegmentHandle {
+                handle,
+                access_order,
+            },
+        );
+        self.evict_over_capacity()
+    }
+
+    fn remove(&mut self, cache_key: &str) -> bool {
+        self.entries.remove(cache_key).is_some()
+    }
+
+    fn evict_over_capacity(&mut self) -> usize {
+        let mut evicted = 0;
+        while self.entries.len() > self.capacity {
+            let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.access_order)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&lru_key);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    fn next_access_order(&mut self) -> u64 {
+        self.next_access_order = self.next_access_order.wrapping_add(1);
+        self.next_access_order
+    }
+}
+
+fn segment_handle_cache_key(kind: ArtifactKind, segment_id: &str) -> String {
+    format!("{}\0{segment_id}", kind.as_str())
+}
+
+fn manifest_version_ms(manifest: &ArtifactManifest) -> u64 {
+    if manifest.version_ms == 0 {
+        manifest.created_at_ms
+    } else {
+        manifest.version_ms
+    }
+}
+
+fn persisted_version_ms(version_ms: u64) -> u64 {
+    if version_ms == 0 {
+        now_ms()
+    } else {
+        version_ms
+    }
+}
+
+fn encode_manifest_record(manifest: &ArtifactManifest) -> Result<Vec<u8>, String> {
+    if manifest.is_segment_backed() {
+        return SegmentLocationRecord::from_manifest(manifest).map(|record| record.encode());
+    }
+
+    serde_json::to_vec(manifest).map_err(|error| format!("failed to encode manifest: {error}"))
+}
+
+fn decode_manifest_record(artifact_id: &str, bytes: &[u8]) -> Result<ArtifactManifest, String> {
+    if let Some(manifest) = SegmentLocationRecord::decode(bytes, artifact_id)? {
+        return Ok(normalize_manifest_version(manifest));
+    }
+
+    serde_json::from_slice(bytes)
+        .map(normalize_manifest_version)
+        .map_err(|error| format!("failed to decode manifest: {error}"))
+}
+
+fn normalize_manifest_version(mut manifest: ArtifactManifest) -> ArtifactManifest {
+    if manifest.version_ms == 0 {
+        manifest.version_ms = manifest.created_at_ms;
+    }
+    manifest.client = manifest.kind.client();
+    manifest.artifact_class = manifest.kind.artifact_class();
+    manifest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
-    use crate::{config::Config, replication::operation::ReplicationOperation};
+    use crate::{
+        config::Config,
+        io::IoController,
+        memory::MemoryController,
+        metrics::Metrics,
+        replication::operation::ReplicationOperation,
+        segment::{reference::SegmentReference, state::SegmentState},
+    };
 
     fn temp_store() -> (TempDir, Config, Store) {
+        temp_store_with(|_| {})
+    }
+
+    fn temp_store_with<F>(override_config: F) -> (TempDir, Config, Store)
+    where
+        F: FnOnce(&mut Config),
+    {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let config = Config {
+        let mut config = Config {
             port: 0,
             tenant_id: "test-tenant".into(),
             region: "local".into(),
@@ -443,23 +1685,58 @@ mod tests {
             data_dir: temp_dir.path().join("data"),
             node_url: "http://127.0.0.1:0".into(),
             peers: vec!["http://127.0.0.1:0".into()],
+            file_descriptor_pool_size: 32,
+            file_descriptor_acquire_timeout_ms: 5_000,
+            segment_handle_cache_size: 8,
+            memory_soft_limit_bytes: 128 * 1024 * 1024,
+            memory_hard_limit_bytes: 256 * 1024 * 1024,
+            manifest_cache_max_bytes: 8 * 1024 * 1024,
+            max_keyvalue_bytes: 512 * 1024,
+            rocksdb_max_open_files: 256,
+            rocksdb_max_background_jobs: 2,
             otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
             otel_service_name: "kura-test".into(),
             otel_deployment_environment: "test".into(),
         };
+        override_config(&mut config);
         std::fs::create_dir_all(config.tmp_dir.join("uploads"))
             .expect("failed to create upload temp dir");
         std::fs::create_dir_all(config.data_dir.join("rocksdb"))
             .expect("failed to create rocksdb dir");
         std::fs::create_dir_all(config.data_dir.join("blobs")).expect("failed to create blobs dir");
+        std::fs::create_dir_all(config.data_dir.join("segments"))
+            .expect("failed to create segments dir");
         std::fs::create_dir_all(config.data_dir.join("multipart"))
             .expect("failed to create multipart dir");
-        let store = Store::open(&config).expect("failed to open store");
+        let io = IoController::new(
+            Metrics::new(config.region.clone(), config.tenant_id.clone()),
+            config.file_descriptor_pool_size,
+            std::time::Duration::from_millis(config.file_descriptor_acquire_timeout_ms),
+        );
+        let memory = MemoryController::new(
+            io.metrics(),
+            config.memory_soft_limit_bytes,
+            config.memory_hard_limit_bytes,
+        );
+        let store = Store::open(&config, io, memory).expect("failed to open store");
         (temp_dir, config, store)
     }
 
-    #[test]
-    fn persist_and_fetch_artifact_round_trip() {
+    async fn read_manifest_bytes(store: &Store, manifest: &ArtifactManifest) -> Vec<u8> {
+        let mut reader = store
+            .open_artifact_reader(manifest)
+            .await
+            .expect("artifact reader should open");
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect("artifact bytes should read");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn persist_and_fetch_segment_backed_artifact_round_trip() {
         let (_temp_dir, _config, store) = temp_store();
 
         let manifest = store
@@ -470,55 +1747,517 @@ mod tests {
                 "application/octet-stream",
                 b"hello",
             )
+            .await
             .expect("failed to persist artifact");
 
         assert!(
             store
                 .artifact_exists(ArtifactKind::Xcode, "ios", "artifact-1")
+                .await
                 .expect("failed to check artifact existence")
         );
 
         let fetched = store
             .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact-1")
+            .await
             .expect("failed to fetch artifact")
             .expect("artifact should exist");
 
         assert_eq!(fetched, manifest);
+        assert!(manifest.is_segment_backed());
+        assert_eq!(read_manifest_bytes(&store, &manifest).await, b"hello");
+        assert_eq!(store.segment_handles.lock().await.len(), 1);
+        let raw = store
+            .db
+            .get_cf(
+                store.cf(ROCKSDB_CF_MANIFESTS),
+                manifest.artifact_id.as_bytes(),
+            )
+            .expect("failed to read raw manifest bytes")
+            .expect("manifest bytes should exist");
         assert_eq!(
-            std::fs::read(&manifest.blob_path).expect("failed to read blob"),
-            b"hello"
+            raw[0], 3,
+            "segment-backed manifest should use compact record"
         );
     }
 
-    #[test]
-    fn delete_namespace_removes_manifests_and_blobs() {
+    #[tokio::test]
+    async fn persist_and_fetch_rocksdb_backed_keyvalue_round_trip() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        let manifest = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Keyvalue,
+                "ios",
+                "artifact-1",
+                "application/json",
+                br#"{"hello":"world"}"#,
+            )
+            .await
+            .expect("failed to persist artifact");
+
+        assert!(!manifest.is_segment_backed());
+        assert!(manifest.blob_path.is_none());
+        assert!(manifest.segment_id.is_none());
+        assert_eq!(
+            store
+                .keyvalue_bytes(&manifest.artifact_id)
+                .expect("failed to read keyvalue bytes")
+                .expect("keyvalue bytes should exist"),
+            br#"{"hello":"world"}"#
+        );
+        assert_eq!(
+            read_manifest_bytes(&store, &manifest).await,
+            br#"{"hello":"world"}"#
+        );
+        let raw = store
+            .db
+            .get_cf(
+                store.cf(ROCKSDB_CF_MANIFESTS),
+                manifest.artifact_id.as_bytes(),
+            )
+            .expect("failed to read raw manifest bytes")
+            .expect("manifest bytes should exist");
+        assert_eq!(
+            raw[0], b'{',
+            "keyvalue manifest should keep json encoding for now"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_index_rebuilds_from_rocksdb_on_restart() {
+        let (_temp_dir, config, store) = temp_store();
+        let manifest = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Module,
+                "ios",
+                "builds/hash-1/Module.framework",
+                "application/octet-stream",
+                b"module-bytes",
+            )
+            .await
+            .expect("failed to persist artifact");
+
+        drop(store);
+
+        let reopened_metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
+        let reopened_io = IoController::new(
+            reopened_metrics,
+            config.file_descriptor_pool_size,
+            std::time::Duration::from_millis(config.file_descriptor_acquire_timeout_ms),
+        );
+        let reopened_memory = MemoryController::new(
+            reopened_io.metrics(),
+            config.memory_soft_limit_bytes,
+            config.memory_hard_limit_bytes,
+        );
+        let reopened =
+            Store::open(&config, reopened_io, reopened_memory).expect("failed to reopen store");
+
+        let rebuilt = reopened
+            .manifest(&manifest.artifact_id)
+            .expect("manifest lookup should succeed")
+            .expect("manifest should be present after rebuild");
+        assert_eq!(rebuilt, manifest);
+        assert_eq!(
+            read_manifest_bytes(&reopened, &rebuilt).await,
+            b"module-bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_cache_stays_within_configured_byte_budget() {
+        let (_temp_dir, _config, store) = temp_store_with(|config| {
+            config.manifest_cache_max_bytes = 256;
+        });
+
+        let first = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Gradle,
+                "ios",
+                "artifact-1",
+                "application/octet-stream",
+                b"first",
+            )
+            .await
+            .expect("failed to persist first artifact");
+        let second = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Gradle,
+                "ios",
+                "artifact-2",
+                "application/octet-stream",
+                b"second",
+            )
+            .await
+            .expect("failed to persist second artifact");
+
+        {
+            let cache = store
+                .manifest_cache
+                .lock()
+                .expect("manifest cache lock poisoned");
+            assert!(
+                cache.total_bytes() <= 256,
+                "manifest cache should stay within its configured byte budget"
+            );
+            assert!(
+                cache.len() < 2,
+                "manifest cache should evict once it cannot hold every manifest"
+            );
+        }
+
+        store.trim_manifest_cache_to(0, "test");
+        let reloaded = store
+            .manifest(&first.artifact_id)
+            .expect("manifest lookup should succeed")
+            .expect("first manifest should reload from RocksDB");
+        assert_eq!(reloaded.artifact_id, first.artifact_id);
+        let reloaded = store
+            .manifest(&second.artifact_id)
+            .expect("manifest lookup should succeed")
+            .expect("second manifest should reload from RocksDB");
+        assert_eq!(reloaded.artifact_id, second.artifact_id);
+    }
+
+    #[tokio::test]
+    async fn segment_handle_cache_evicts_least_recently_used_handles_when_full() {
+        let (_temp_dir, _config, store) = temp_store_with(|config| {
+            config.segment_handle_cache_size = 1;
+        });
+
+        let xcode = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact-1",
+                "application/octet-stream",
+                b"xcode",
+            )
+            .await
+            .expect("failed to persist xcode artifact");
+        let gradle = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Gradle,
+                "android",
+                "artifact-2",
+                "application/octet-stream",
+                b"gradle",
+            )
+            .await
+            .expect("failed to persist gradle artifact");
+
+        let _ = read_manifest_bytes(&store, &xcode).await;
+        {
+            let cache = store.segment_handles.lock().await;
+            assert_eq!(cache.len(), 1);
+            assert!(
+                cache.entries.contains_key(&segment_handle_cache_key(
+                    ArtifactKind::Xcode,
+                    xcode
+                        .segment_id
+                        .as_deref()
+                        .expect("xcode manifest should have a segment id")
+                ))
+            );
+        }
+
+        let _ = read_manifest_bytes(&store, &gradle).await;
+        {
+            let cache = store.segment_handles.lock().await;
+            assert_eq!(cache.len(), 1);
+            assert!(
+                !cache.entries.contains_key(&segment_handle_cache_key(
+                    ArtifactKind::Xcode,
+                    xcode
+                        .segment_id
+                        .as_deref()
+                        .expect("xcode manifest should have a segment id")
+                ))
+            );
+            assert!(
+                cache.entries.contains_key(&segment_handle_cache_key(
+                    ArtifactKind::Gradle,
+                    gradle
+                        .segment_id
+                        .as_deref()
+                        .expect("gradle manifest should have a segment id")
+                ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_artifact_refreshes_old_segment_backed_artifacts() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        let manifest = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact-1",
+                "application/octet-stream",
+                b"hello",
+            )
+            .await
+            .expect("failed to persist artifact");
+        let original_segment_id = manifest
+            .segment_id
+            .clone()
+            .expect("segment-backed artifact should have a segment id");
+        store
+            .save_segment_state(
+                ArtifactKind::Xcode,
+                &SegmentState {
+                    old: vec![SegmentReference::new(original_segment_id.clone(), 1)],
+                    current: Vec::new(),
+                    new: vec![SegmentReference::new("fresh-segment".into(), 2)],
+                },
+            )
+            .expect("failed to seed segment state");
+
+        let fetched = store
+            .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact-1")
+            .await
+            .expect("failed to fetch artifact")
+            .expect("artifact should still exist");
+
+        assert_ne!(fetched.segment_id, Some(original_segment_id));
+        assert_eq!(read_manifest_bytes(&store, &fetched).await, b"hello");
+        assert_eq!(
+            store
+                .manifest(&fetched.artifact_id)
+                .expect("failed to load manifest")
+                .expect("refreshed manifest should still exist"),
+            fetched
+        );
+        assert_eq!(store.segment_handles.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn evict_segment_removes_segment_backed_manifests() {
         let (_temp_dir, _config, store) = temp_store();
 
         let manifest = store
             .persist_artifact_from_bytes(
                 ArtifactKind::Gradle,
                 "android",
-                "gradle-1",
+                "artifact-1",
                 "application/octet-stream",
-                b"gradle-cache",
+                b"hello",
             )
+            .await
+            .expect("failed to persist artifact");
+        let segment_id = manifest
+            .segment_id
+            .clone()
+            .expect("segment-backed artifact should have a segment id");
+        let segment_path = store.segment_path(ArtifactKind::Gradle, &segment_id);
+
+        store
+            .evict_segment(ArtifactKind::Gradle, &segment_id)
+            .await
+            .expect("failed to evict segment");
+
+        assert!(
+            store
+                .fetch_artifact(ArtifactKind::Gradle, "android", "artifact-1")
+                .await
+                .expect("failed to fetch artifact")
+                .is_none()
+        );
+        assert!(
+            store
+                .manifest(&manifest.artifact_id)
+                .expect("failed to load manifest")
+                .is_none()
+        );
+        assert!(!segment_path.exists());
+        assert_eq!(store.segment_handles.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_namespace_removes_keyvalue_payloads() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        let manifest = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Keyvalue,
+                "android",
+                "gradle-1",
+                "application/json",
+                br#"{"gradle":"cache"}"#,
+            )
+            .await
             .expect("failed to persist artifact");
 
         store
             .delete_namespace("android")
+            .await
             .expect("failed to delete namespace");
 
         assert!(
             store
-                .fetch_artifact(ArtifactKind::Gradle, "android", "gradle-1")
+                .fetch_artifact(ArtifactKind::Keyvalue, "android", "gradle-1")
+                .await
                 .expect("failed to fetch artifact")
                 .is_none()
         );
-        assert!(!Path::new(&manifest.blob_path).exists());
+        assert!(
+            store
+                .keyvalue_bytes(&manifest.artifact_id)
+                .expect("failed to read keyvalue bytes")
+                .is_none()
+        );
     }
 
-    #[test]
-    fn multipart_upload_round_trip() {
+    #[tokio::test]
+    async fn replicated_namespace_tombstones_reject_stale_upserts() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        assert!(
+            store
+                .apply_replicated_namespace_delete("ios", 200)
+                .await
+                .expect("namespace delete should apply")
+        );
+
+        assert!(
+            !store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Gradle,
+                    "ios",
+                    "artifact-1",
+                    "application/octet-stream",
+                    b"stale",
+                    100,
+                )
+                .await
+                .expect("stale artifact should be ignored")
+        );
+        assert!(
+            !store
+                .artifact_version_is_current(ArtifactKind::Gradle, "ios", "artifact-1", 100)
+                .expect("version check should succeed")
+        );
+        assert!(
+            store
+                .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact-1")
+                .await
+                .expect("artifact fetch should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_namespace_delete_only_removes_older_artifacts() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        assert!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Gradle,
+                    "ios",
+                    "artifact-old",
+                    "application/octet-stream",
+                    b"old",
+                    100,
+                )
+                .await
+                .expect("old artifact should apply")
+        );
+        assert!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Gradle,
+                    "ios",
+                    "artifact-new",
+                    "application/octet-stream",
+                    b"new",
+                    300,
+                )
+                .await
+                .expect("new artifact should apply")
+        );
+
+        assert!(
+            store
+                .apply_replicated_namespace_delete("ios", 200)
+                .await
+                .expect("namespace delete should apply")
+        );
+
+        assert!(
+            store
+                .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact-old")
+                .await
+                .expect("old artifact fetch should succeed")
+                .is_none()
+        );
+        let remaining = store
+            .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact-new")
+            .await
+            .expect("new artifact fetch should succeed")
+            .expect("newer artifact should remain");
+        assert_eq!(remaining.version_ms, 300);
+        assert_eq!(read_manifest_bytes(&store, &remaining).await, b"new");
+    }
+
+    #[tokio::test]
+    async fn newer_replicated_upserts_win_over_older_ones() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        assert!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Xcode,
+                    "ios",
+                    "artifact",
+                    "application/octet-stream",
+                    b"v1",
+                    100,
+                )
+                .await
+                .expect("initial artifact should apply")
+        );
+        assert!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Xcode,
+                    "ios",
+                    "artifact",
+                    "application/octet-stream",
+                    b"v2",
+                    200,
+                )
+                .await
+                .expect("newer artifact should apply")
+        );
+        assert!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Xcode,
+                    "ios",
+                    "artifact",
+                    "application/octet-stream",
+                    b"stale",
+                    150,
+                )
+                .await
+                .expect("stale artifact should resolve cleanly")
+        );
+
+        let manifest = store
+            .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact")
+            .await
+            .expect("artifact fetch should succeed")
+            .expect("artifact should remain");
+        assert_eq!(manifest.version_ms, 200);
+        assert_eq!(read_manifest_bytes(&store, &manifest).await, b"v2");
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_round_trip() {
         let (_temp_dir, config, store) = temp_store();
         let upload_id = store
             .start_multipart_upload("acme", "ios", "builds", "hash-1", "Module.framework")
@@ -531,17 +2270,20 @@ mod tests {
 
         store
             .add_multipart_part(&upload_id, 1, &part_1, 9)
+            .await
             .expect("failed to store part 1");
         store
             .add_multipart_part(&upload_id, 2, &part_2, 8)
+            .await
             .expect("failed to store part 2");
 
         let manifest = store
             .complete_multipart_upload(&upload_id, &[1, 2])
+            .await
             .expect("failed to complete upload");
 
         assert_eq!(
-            std::fs::read(&manifest.blob_path).expect("failed to read assembled artifact"),
+            read_manifest_bytes(&store, &manifest).await,
             b"part-one-part-two"
         );
         assert!(
@@ -587,6 +2329,7 @@ mod tests {
                 target: "http://peer".into(),
                 operation: ReplicationOperation::DeleteNamespace {
                     namespace_id: "ios".into(),
+                    version_ms: 123,
                 },
             })
             .expect("failed to enqueue outbox message");
@@ -603,6 +2346,7 @@ mod tests {
                 target: "http://peer".into(),
                 operation: ReplicationOperation::DeleteNamespace {
                     namespace_id: "ios".into(),
+                    version_ms: 123,
                 },
             }
         );
