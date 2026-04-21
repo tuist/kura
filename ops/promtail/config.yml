@@ -24,7 +24,7 @@ scrape_configs:
         target_label: service
       - source_labels: [__meta_docker_container_name]
         target_label: container
-      - source_labels: [__meta_docker_container_label_cache_region]
+      - source_labels: [__meta_docker_container_label_kura_region]
         target_label: region
-      - source_labels: [__meta_docker_container_label_cache_tenant]
-        target_label: tenant
+      - source_labels: [__meta_docker_container_label_kura_tenant_id]
+        target_label: tenant_id

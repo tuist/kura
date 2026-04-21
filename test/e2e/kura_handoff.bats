@@ -1,21 +1,21 @@
 #!/usr/bin/env bats
 
 setup_file() {
-  export COMPOSE_PROJECT_NAME="cache-handoff"
-  export CACHE_US_PORT=4301
-  export CACHE_EU_PORT=4302
-  export CACHE_AP_PORT=4303
+  export COMPOSE_PROJECT_NAME="kura-handoff"
+  export KURA_US_PORT=4301
+  export KURA_EU_PORT=4302
+  export KURA_AP_PORT=4303
   export TEMPO_PORT=3302
   export OTLP_PORT=4419
-  export CACHE_US_URL="http://localhost:${CACHE_US_PORT}"
-  export CACHE_EU_URL="http://localhost:${CACHE_EU_PORT}"
-  export CACHE_AP_URL="http://localhost:${CACHE_AP_PORT}"
+  export KURA_US_URL="http://localhost:${KURA_US_PORT}"
+  export KURA_EU_URL="http://localhost:${KURA_EU_PORT}"
+  export KURA_AP_URL="http://localhost:${KURA_AP_PORT}"
   dc down -v --remove-orphans >/dev/null 2>&1 || true
-  dc build cache-us cache-eu cache-ap
-  dc up -d cache-us
+  dc build kura-us kura-eu kura-ap
+  dc up -d kura-us
 
-  wait_for_http "${CACHE_US_URL}/up"
-  wait_for_contains "${CACHE_US_URL}/up" '"ring_members":1'
+  wait_for_http "${KURA_US_URL}/up"
+  wait_for_contains "${KURA_US_URL}/up" '"ring_members":1'
 }
 
 teardown_file() {
@@ -64,33 +64,33 @@ status_only() {
 
 @test "outbox replication moves singleton data to joined nodes" {
   run status_only -X PUT \
-    "${CACHE_US_URL}/api/cache/keyvalue?account_handle=acme&project_handle=handoff" \
+    "${KURA_US_URL}/api/cache/keyvalue?tenant_id=acme&namespace_id=handoff" \
     -H "content-type: application/json" \
     -d '{"cas_id":"handoff-1","entries":[{"value":"from-singleton"},{"value":"ready-for-join"}]}'
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run wait_for_contains \
-    "${CACHE_US_URL}/api/cache/keyvalue/handoff-1?account_handle=acme&project_handle=handoff" \
+    "${KURA_US_URL}/api/cache/keyvalue/handoff-1?tenant_id=acme&namespace_id=handoff" \
     '"from-singleton"'
   [ "$status" -eq 0 ]
 
-  dc up -d cache-eu cache-ap
+  dc up -d kura-eu kura-ap
 
-  wait_for_http "${CACHE_EU_URL}/up"
-  wait_for_http "${CACHE_AP_URL}/up"
-  wait_for_contains "${CACHE_US_URL}/up" '"ring_members":3'
-  wait_for_contains "${CACHE_EU_URL}/up" '"ring_members":3'
-  wait_for_contains "${CACHE_AP_URL}/up" '"ring_members":3'
+  wait_for_http "${KURA_EU_URL}/up"
+  wait_for_http "${KURA_AP_URL}/up"
+  wait_for_contains "${KURA_US_URL}/up" '"ring_members":3'
+  wait_for_contains "${KURA_EU_URL}/up" '"ring_members":3'
+  wait_for_contains "${KURA_AP_URL}/up" '"ring_members":3'
 
   run wait_for_contains \
-    "${CACHE_EU_URL}/api/cache/keyvalue/handoff-1?account_handle=acme&project_handle=handoff" \
+    "${KURA_EU_URL}/api/cache/keyvalue/handoff-1?tenant_id=acme&namespace_id=handoff" \
     '"from-singleton"'
   [ "$status" -eq 0 ]
   [[ "$output" == *'"ready-for-join"'* ]]
 
   run wait_for_contains \
-    "${CACHE_AP_URL}/api/cache/keyvalue/handoff-1?account_handle=acme&project_handle=handoff" \
+    "${KURA_AP_URL}/api/cache/keyvalue/handoff-1?tenant_id=acme&namespace_id=handoff" \
     '"from-singleton"'
   [ "$status" -eq 0 ]
   [[ "$output" == *'"ready-for-join"'* ]]

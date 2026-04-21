@@ -1,29 +1,29 @@
 #!/usr/bin/env bats
 
 setup_file() {
-  export COMPOSE_PROJECT_NAME="cache-e2e"
-  export CACHE_US_PORT=4201
-  export CACHE_EU_PORT=4202
-  export CACHE_AP_PORT=4203
+  export COMPOSE_PROJECT_NAME="kura-e2e"
+  export KURA_US_PORT=4201
+  export KURA_EU_PORT=4202
+  export KURA_AP_PORT=4203
   export GRAFANA_PORT=3300
   export PROMETHEUS_PORT=9190
   export LOKI_PORT=3201
   export TEMPO_PORT=3301
   export OTLP_PORT=4418
-  export CACHE_US_URL="http://localhost:${CACHE_US_PORT}"
-  export CACHE_EU_URL="http://localhost:${CACHE_EU_PORT}"
-  export CACHE_AP_URL="http://localhost:${CACHE_AP_PORT}"
+  export KURA_US_URL="http://localhost:${KURA_US_PORT}"
+  export KURA_EU_URL="http://localhost:${KURA_EU_PORT}"
+  export KURA_AP_URL="http://localhost:${KURA_AP_PORT}"
   export GRAFANA_URL="http://localhost:${GRAFANA_PORT}"
   export PROMETHEUS_URL="http://localhost:${PROMETHEUS_PORT}"
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   dc up --build -d
 
-  wait_for_http "${CACHE_US_URL}/up"
-  wait_for_http "${CACHE_EU_URL}/up"
-  wait_for_http "${CACHE_AP_URL}/up"
-  wait_for_contains "${CACHE_US_URL}/up" '"ring_members":3'
-  wait_for_contains "${CACHE_EU_URL}/up" '"ring_members":3'
-  wait_for_contains "${CACHE_AP_URL}/up" '"ring_members":3'
+  wait_for_http "${KURA_US_URL}/up"
+  wait_for_http "${KURA_EU_URL}/up"
+  wait_for_http "${KURA_AP_URL}/up"
+  wait_for_contains "${KURA_US_URL}/up" '"ring_members":3'
+  wait_for_contains "${KURA_EU_URL}/up" '"ring_members":3'
+  wait_for_contains "${KURA_AP_URL}/up" '"ring_members":3'
   wait_for_http "${GRAFANA_URL}/api/health"
   wait_for_http "${PROMETHEUS_URL}/-/ready"
 }
@@ -74,14 +74,14 @@ status_only() {
 
 @test "keyvalue entries sync across regions" {
   run status_only -X PUT \
-    "${CACHE_US_URL}/api/cache/keyvalue?account_handle=acme&project_handle=ios" \
+    "${KURA_US_URL}/api/cache/keyvalue?tenant_id=acme&namespace_id=ios" \
     -H "content-type: application/json" \
     -d '{"cas_id":"cas-1","entries":[{"value":"hello"},{"value":"world"}]}'
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run wait_for_contains \
-    "${CACHE_EU_URL}/api/cache/keyvalue/cas-1?account_handle=acme&project_handle=ios" \
+    "${KURA_EU_URL}/api/cache/keyvalue/cas-1?tenant_id=acme&namespace_id=ios" \
     '"hello"'
   [ "$status" -eq 0 ]
   [[ "$output" == *'"world"'* ]]
@@ -89,24 +89,24 @@ status_only() {
 
 @test "xcode artifacts persist on disk and survive api node restart" {
   run status_only -X POST \
-    "${CACHE_US_URL}/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios" \
+    "${KURA_US_URL}/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios" \
     -H "content-type: application/octet-stream" \
     --data-binary "xcode-binary"
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run wait_for_contains \
-    "${CACHE_EU_URL}/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios" \
+    "${KURA_EU_URL}/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios" \
     "xcode-binary"
   [ "$status" -eq 0 ]
   [ "$output" = "xcode-binary" ]
 
-  dc restart cache-eu >/dev/null
-  wait_for_http "${CACHE_EU_URL}/up"
-  wait_for_contains "${CACHE_EU_URL}/up" '"ring_members":3'
+  dc restart kura-eu >/dev/null
+  wait_for_http "${KURA_EU_URL}/up"
+  wait_for_contains "${KURA_EU_URL}/up" '"ring_members":3'
 
   run wait_for_contains \
-    "${CACHE_EU_URL}/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios" \
+    "${KURA_EU_URL}/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios" \
     "xcode-binary"
   [ "$status" -eq 0 ]
   [ "$output" = "xcode-binary" ]
@@ -114,70 +114,70 @@ status_only() {
 
 @test "gradle artifacts sync to another region" {
   run status_only -X PUT \
-    "${CACHE_EU_URL}/api/cache/gradle/gradle-key-1?account_handle=acme&project_handle=android" \
+    "${KURA_EU_URL}/api/cache/gradle/gradle-key-1?tenant_id=acme&namespace_id=android" \
     -H "content-type: application/octet-stream" \
     --data-binary "gradle-cache"
   [ "$status" -eq 0 ]
   [ "$output" = "201" ]
 
   run wait_for_contains \
-    "${CACHE_AP_URL}/api/cache/gradle/gradle-key-1?account_handle=acme&project_handle=android" \
+    "${KURA_AP_URL}/api/cache/gradle/gradle-key-1?tenant_id=acme&namespace_id=android" \
     "gradle-cache"
   [ "$status" -eq 0 ]
 }
 
 @test "multipart module uploads are visible from another node" {
   run curl -fsS -X POST \
-    "${CACHE_US_URL}/api/cache/module/start?account_handle=acme&project_handle=ios&hash=hash-1&name=Module.framework&cache_category=builds"
+    "${KURA_US_URL}/api/cache/module/start?tenant_id=acme&namespace_id=ios&hash=hash-1&name=Module.framework&cache_category=builds"
   [ "$status" -eq 0 ]
   upload_id="$(printf '%s' "$output" | sed -E 's/.*"upload_id":"([^"]+)".*/\1/')"
   [ -n "$upload_id" ]
 
   run status_only -X POST \
-    "${CACHE_US_URL}/api/cache/module/part?upload_id=${upload_id}&part_number=1" \
+    "${KURA_US_URL}/api/cache/module/part?upload_id=${upload_id}&part_number=1" \
     -H "content-type: application/octet-stream" \
     --data-binary "part-one-"
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run status_only -X POST \
-    "${CACHE_US_URL}/api/cache/module/part?upload_id=${upload_id}&part_number=2" \
+    "${KURA_US_URL}/api/cache/module/part?upload_id=${upload_id}&part_number=2" \
     -H "content-type: application/octet-stream" \
     --data-binary "part-two"
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run status_only -X POST \
-    "${CACHE_US_URL}/api/cache/module/complete?upload_id=${upload_id}" \
+    "${KURA_US_URL}/api/cache/module/complete?upload_id=${upload_id}" \
     -H "content-type: application/json" \
     -d '{"parts":[1,2]}'
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run status_only -I \
-    "${CACHE_EU_URL}/api/cache/module/module-1?account_handle=acme&project_handle=ios&hash=hash-1&name=Module.framework&cache_category=builds"
+    "${KURA_EU_URL}/api/cache/module/module-1?tenant_id=acme&namespace_id=ios&hash=hash-1&name=Module.framework&cache_category=builds"
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run wait_for_contains \
-    "${CACHE_EU_URL}/api/cache/module/module-1?account_handle=acme&project_handle=ios&hash=hash-1&name=Module.framework&cache_category=builds" \
+    "${KURA_EU_URL}/api/cache/module/module-1?tenant_id=acme&namespace_id=ios&hash=hash-1&name=Module.framework&cache_category=builds" \
     "part-one-part-two"
   [ "$status" -eq 0 ]
 }
 
-@test "clean removes project artifacts across the cluster" {
+@test "clean removes namespace artifacts across the cluster" {
   run status_only -X DELETE \
-    "${CACHE_AP_URL}/api/cache/clean?account_handle=acme&project_handle=ios"
+    "${KURA_AP_URL}/api/cache/clean?tenant_id=acme&namespace_id=ios"
   [ "$status" -eq 0 ]
   [ "$output" = "204" ]
 
   run status_only \
-    "${CACHE_US_URL}/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios"
+    "${KURA_US_URL}/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios"
   [ "$status" -eq 0 ]
   [ "$output" = "404" ]
 
   run status_only \
-    "${CACHE_EU_URL}/api/cache/keyvalue/cas-1?account_handle=acme&project_handle=ios"
+    "${KURA_EU_URL}/api/cache/keyvalue/cas-1?tenant_id=acme&namespace_id=ios"
   [ "$status" -eq 0 ]
   [ "$output" = "404" ]
 }
@@ -188,14 +188,14 @@ status_only() {
   [[ "$output" == *'"database":"ok"'* ]]
 
   run wait_for_contains \
-    "${PROMETHEUS_URL}/api/v1/query?query=cache_node_info" \
+    "${PROMETHEUS_URL}/api/v1/query?query=kura_node_info" \
     "us-east"
   [ "$status" -eq 0 ]
   [[ "$output" == *"us-east"* ]]
   [[ "$output" == *"eu-west"* ]]
   [[ "$output" == *"ap-south"* ]]
 
-  run curl -fsS "${CACHE_US_URL}/metrics"
+  run curl -fsS "${KURA_US_URL}/metrics"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"cache_http_requests_total"* ]]
+  [[ "$output" == *"kura_http_requests_total"* ]]
 }
