@@ -40,7 +40,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, route) (rate(cache_http_requests_total[5m]))",
+          "expr": "sum by (region, route) (rate(kura_http_requests_total[5m]))",
           "legendFormat": "{{region}} {{route}}",
           "refId": "A"
         }
@@ -78,7 +78,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, region, route) (rate(cache_http_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, region, route) (rate(kura_http_request_duration_seconds_bucket[5m])))",
           "legendFormat": "{{region}} {{route}}",
           "refId": "A"
         }
@@ -115,7 +115,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, route, kind) (rate(cache_http_exceptions_total[5m]))",
+          "expr": "sum by (region, route, kind) (rate(kura_http_exceptions_total[5m]))",
           "legendFormat": "{{region}} {{route}} {{kind}}",
           "refId": "A"
         }
@@ -152,7 +152,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, kind, result) (rate(cache_artifact_writes_total[5m]))",
+          "expr": "sum by (region, kind, result) (rate(kura_artifact_writes_total[5m]))",
           "legendFormat": "{{region}} {{kind}} {{result}}",
           "refId": "A"
         }
@@ -189,7 +189,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, kind, result) (rate(cache_artifact_reads_total[5m]))",
+          "expr": "sum by (region, kind, result) (rate(kura_artifact_reads_total[5m]))",
           "legendFormat": "{{region}} {{kind}} {{result}}",
           "refId": "A"
         }
@@ -227,7 +227,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, kind, result) (rate(cache_artifact_write_bytes_total[5m]))",
+          "expr": "sum by (region, kind, result) (rate(kura_artifact_write_bytes_total[5m]))",
           "legendFormat": "{{region}} {{kind}} {{result}}",
           "refId": "A"
         }
@@ -265,7 +265,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, kind, result) (rate(cache_artifact_read_bytes_total[5m]))",
+          "expr": "sum by (region, kind, result) (rate(kura_artifact_read_bytes_total[5m]))",
           "legendFormat": "{{region}} {{kind}} {{result}}",
           "refId": "A"
         }
@@ -302,7 +302,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (target, operation, result) (rate(cache_replication_requests_total[5m]))",
+          "expr": "sum by (target, operation, result) (rate(kura_replication_requests_total[5m]))",
           "legendFormat": "{{target}} {{operation}} {{result}}",
           "refId": "A"
         }
@@ -340,7 +340,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, target, operation) (rate(cache_replication_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, target, operation) (rate(kura_replication_request_duration_seconds_bucket[5m])))",
           "legendFormat": "{{target}} {{operation}}",
           "refId": "A"
         }
@@ -377,7 +377,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (region, result) (rate(cache_multipart_parts_total[5m]))",
+          "expr": "sum by (region, result) (rate(kura_multipart_parts_total[5m]))",
           "legendFormat": "{{region}} {{result}}",
           "refId": "A"
         }
@@ -432,7 +432,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "count(cache_node_info)",
+          "expr": "count(kura_node_info)",
           "refId": "A"
         }
       ],
@@ -462,12 +462,12 @@
       },
       "targets": [
         {
-          "expr": "{project=\"cache\",service=~\"cache-us|cache-eu|cache-ap\"}",
+          "expr": "{service=~\"kura-us|kura-eu|kura-ap\"}",
           "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Cache Node Logs",
+      "title": "Kura Node Logs",
       "type": "logs"
     }
   ],
@@ -475,7 +475,7 @@
   "schemaVersion": 41,
   "style": "dark",
   "tags": [
-    "cache"
+    "kura"
   ],
   "templating": {
     "list": []
@@ -485,7 +485,7 @@
     "to": "now"
   },
   "timezone": "browser",
-  "title": "cache Cluster",
-  "uid": "cache-cluster",
+  "title": "Kura Cluster",
+  "uid": "kura-cluster",
   "version": 1
 }

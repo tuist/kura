@@ -3,15 +3,15 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: cache
+  - job_name: kura
     static_configs:
-      - targets: ["cache-us:4000"]
+      - targets: ["kura-us:4000"]
         labels:
           region: us-east
-      - targets: ["cache-eu:4000"]
+      - targets: ["kura-eu:4000"]
         labels:
           region: eu-west
-      - targets: ["cache-ap:4000"]
+      - targets: ["kura-ap:4000"]
         labels:
           region: ap-south
 

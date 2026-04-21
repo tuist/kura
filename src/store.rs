@@ -11,19 +11,19 @@ use crate::{
     config::Config,
     constants::{
         MAX_MODULE_TOTAL_BYTES, ROCKSDB_CF_MANIFESTS, ROCKSDB_CF_MULTIPART_UPLOADS,
-        ROCKSDB_CF_OUTBOX, ROCKSDB_CF_PROJECT_ARTIFACTS,
+        ROCKSDB_CF_NAMESPACE_ARTIFACTS, ROCKSDB_CF_OUTBOX,
     },
     multipart::{error::MultipartError, part::MultipartPart, upload::MultipartUpload},
     replication::outbox_message::OutboxMessage,
     utils::{
-        artifact_storage_id, blob_path, module_key, now_ms, project_artifact_index_key,
+        artifact_storage_id, blob_path, module_key, namespace_artifact_index_key, now_ms,
         temp_file_path,
     },
 };
 
 pub struct Store {
     db: DB,
-    account: String,
+    tenant_id: String,
     tmp_dir: PathBuf,
     data_dir: PathBuf,
 }
@@ -37,7 +37,7 @@ impl Store {
 
         let cfs = vec![
             ColumnFamilyDescriptor::new(ROCKSDB_CF_MANIFESTS, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_PROJECT_ARTIFACTS, Options::default()),
+            ColumnFamilyDescriptor::new(ROCKSDB_CF_NAMESPACE_ARTIFACTS, Options::default()),
             ColumnFamilyDescriptor::new(ROCKSDB_CF_MULTIPART_UPLOADS, Options::default()),
             ColumnFamilyDescriptor::new(ROCKSDB_CF_OUTBOX, Options::default()),
         ];
@@ -48,7 +48,7 @@ impl Store {
 
         Ok(Self {
             db,
-            account: config.account.clone(),
+            tenant_id: config.tenant_id.clone(),
             tmp_dir: config.tmp_dir.clone(),
             data_dir: config.data_dir.clone(),
         })
@@ -57,10 +57,10 @@ impl Store {
     pub fn artifact_exists(
         &self,
         kind: ArtifactKind,
-        project_handle: &str,
+        namespace_id: &str,
         key: &str,
     ) -> Result<bool, String> {
-        let artifact_id = artifact_storage_id(kind, &self.account, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
         match self.manifest(&artifact_id)? {
             Some(manifest) => Ok(Path::new(&manifest.blob_path).exists()),
             None => Ok(false),
@@ -83,10 +83,10 @@ impl Store {
     pub fn fetch_artifact(
         &self,
         kind: ArtifactKind,
-        project_handle: &str,
+        namespace_id: &str,
         key: &str,
     ) -> Result<Option<ArtifactManifest>, String> {
-        let artifact_id = artifact_storage_id(kind, &self.account, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
         match self.manifest(&artifact_id)? {
             Some(manifest) if Path::new(&manifest.blob_path).exists() => Ok(Some(manifest)),
             Some(_) => Ok(None),
@@ -97,12 +97,12 @@ impl Store {
     pub fn persist_artifact_from_path(
         &self,
         kind: ArtifactKind,
-        project_handle: &str,
+        namespace_id: &str,
         key: &str,
         content_type: &str,
         source_path: &Path,
     ) -> Result<ArtifactManifest, String> {
-        let artifact_id = artifact_storage_id(kind, &self.account, project_handle, key);
+        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
         let destination = blob_path(&self.data_dir, kind, &artifact_id);
         let parent = destination
             .parent()
@@ -126,7 +126,7 @@ impl Store {
         let manifest = ArtifactManifest {
             artifact_id: artifact_id.clone(),
             kind,
-            project_handle: project_handle.to_owned(),
+            namespace_id: namespace_id.to_owned(),
             key: key.to_owned(),
             content_type: content_type.to_owned(),
             blob_path: destination.to_string_lossy().into_owned(),
@@ -143,8 +143,8 @@ impl Store {
             manifest_bytes,
         );
         batch.put_cf(
-            self.cf(ROCKSDB_CF_PROJECT_ARTIFACTS),
-            project_artifact_index_key(project_handle, &artifact_id).as_bytes(),
+            self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS),
+            namespace_artifact_index_key(namespace_id, &artifact_id).as_bytes(),
             [],
         );
 
@@ -158,7 +158,7 @@ impl Store {
     pub fn persist_artifact_from_bytes(
         &self,
         kind: ArtifactKind,
-        project_handle: &str,
+        namespace_id: &str,
         key: &str,
         content_type: &str,
         bytes: &[u8],
@@ -166,41 +166,41 @@ impl Store {
         let temp_path = temp_file_path(&self.tmp_dir.join("uploads"), "replication");
         std::fs::write(&temp_path, bytes)
             .map_err(|error| format!("failed to write temp blob: {error}"))?;
-        self.persist_artifact_from_path(kind, project_handle, key, content_type, &temp_path)
+        self.persist_artifact_from_path(kind, namespace_id, key, content_type, &temp_path)
     }
 
-    pub fn delete_project(&self, project_handle: &str) -> Result<(), String> {
-        let prefix = format!("{project_handle}\0");
+    pub fn delete_namespace(&self, namespace_id: &str) -> Result<(), String> {
+        let prefix = format!("{namespace_id}\0");
         let mut batch = WriteBatch::default();
         let mut blob_paths = Vec::new();
 
         let iter = self.db.iterator_cf(
-            self.cf(ROCKSDB_CF_PROJECT_ARTIFACTS),
+            self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS),
             IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
         );
 
         for item in iter {
             let (index_key, _) =
-                item.map_err(|error| format!("failed to iterate project index: {error}"))?;
+                item.map_err(|error| format!("failed to iterate namespace index: {error}"))?;
             if !index_key.starts_with(prefix.as_bytes()) {
                 break;
             }
 
             let artifact_id = std::str::from_utf8(&index_key[prefix.len()..])
-                .map_err(|error| format!("invalid project index key: {error}"))?
+                .map_err(|error| format!("invalid namespace index key: {error}"))?
                 .to_owned();
 
             if let Some(manifest) = self.manifest(&artifact_id)? {
                 blob_paths.push(PathBuf::from(manifest.blob_path));
             }
 
-            batch.delete_cf(self.cf(ROCKSDB_CF_PROJECT_ARTIFACTS), index_key);
+            batch.delete_cf(self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS), index_key);
             batch.delete_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes());
         }
 
         self.db
             .write(batch)
-            .map_err(|error| format!("failed to delete project batch: {error}"))?;
+            .map_err(|error| format!("failed to delete namespace batch: {error}"))?;
 
         for path in blob_paths {
             let _ = std::fs::remove_file(path);
@@ -211,8 +211,8 @@ impl Store {
 
     pub fn start_multipart_upload(
         &self,
-        account_handle: &str,
-        project_handle: &str,
+        tenant_id: &str,
+        namespace_id: &str,
         category: &str,
         hash: &str,
         name: &str,
@@ -220,8 +220,8 @@ impl Store {
         let upload_id = Uuid::now_v7().to_string();
         let upload = MultipartUpload {
             upload_id: upload_id.clone(),
-            account_handle: account_handle.to_owned(),
-            project_handle: project_handle.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            namespace_id: namespace_id.to_owned(),
             category: category.to_owned(),
             hash: hash.to_owned(),
             name: name.to_owned(),
@@ -347,7 +347,7 @@ impl Store {
         let manifest = self
             .persist_artifact_from_path(
                 ArtifactKind::Module,
-                &upload.project_handle,
+                &upload.namespace_id,
                 &key,
                 "application/octet-stream",
                 &assembled_path,
@@ -437,14 +437,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let config = Config {
             port: 0,
-            account: "test-account".into(),
+            tenant_id: "test-tenant".into(),
             region: "local".into(),
             tmp_dir: temp_dir.path().join("tmp"),
             data_dir: temp_dir.path().join("data"),
             node_url: "http://127.0.0.1:0".into(),
             peers: vec!["http://127.0.0.1:0".into()],
             otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
-            otel_service_name: "cache-test".into(),
+            otel_service_name: "kura-test".into(),
             otel_deployment_environment: "test".into(),
         };
         std::fs::create_dir_all(config.tmp_dir.join("uploads"))
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_project_removes_manifests_and_blobs() {
+    fn delete_namespace_removes_manifests_and_blobs() {
         let (_temp_dir, _config, store) = temp_store();
 
         let manifest = store
@@ -505,8 +505,8 @@ mod tests {
             .expect("failed to persist artifact");
 
         store
-            .delete_project("android")
-            .expect("failed to delete project");
+            .delete_namespace("android")
+            .expect("failed to delete namespace");
 
         assert!(
             store
@@ -585,8 +585,8 @@ mod tests {
         store
             .enqueue(OutboxMessage {
                 target: "http://peer".into(),
-                operation: ReplicationOperation::DeleteProject {
-                    project_handle: "ios".into(),
+                operation: ReplicationOperation::DeleteNamespace {
+                    namespace_id: "ios".into(),
                 },
             })
             .expect("failed to enqueue outbox message");
@@ -601,8 +601,8 @@ mod tests {
             *message,
             OutboxMessage {
                 target: "http://peer".into(),
-                operation: ReplicationOperation::DeleteProject {
-                    project_handle: "ios".into(),
+                operation: ReplicationOperation::DeleteNamespace {
+                    namespace_id: "ios".into(),
                 },
             }
         );

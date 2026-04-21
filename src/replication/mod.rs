@@ -29,7 +29,7 @@ pub fn enqueue_replication_for_artifact(state: &SharedState, manifest: &Artifact
             target: peer.clone(),
             operation: ReplicationOperation::UpsertArtifact {
                 kind: manifest.kind,
-                project_handle: manifest.project_handle.clone(),
+                namespace_id: manifest.namespace_id.clone(),
                 key: manifest.key.clone(),
                 content_type: manifest.content_type.clone(),
                 artifact_id: manifest.artifact_id.clone(),
@@ -133,7 +133,7 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
     match &message.operation {
         ReplicationOperation::UpsertArtifact {
             kind,
-            project_handle,
+            namespace_id,
             key,
             content_type,
             artifact_id,
@@ -151,10 +151,10 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
             })?;
 
             let url = format!(
-                "{}/_internal/replicate/artifact?kind={}&project_handle={}&key={}&content_type={}",
+                "{}/_internal/replicate/artifact?kind={}&namespace_id={}&key={}&content_type={}",
                 message.target,
                 kind.as_str(),
-                url_encode(project_handle),
+                url_encode(namespace_id),
                 url_encode(key),
                 url_encode(content_type),
             );
@@ -163,7 +163,7 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
                 "replication.request",
                 otel.name = "PUT /_internal/replicate/artifact",
                 otel.kind = "client",
-                cache.operation = "upsert_artifact",
+                kura.operation = "upsert_artifact",
                 http.request.method = "PUT",
                 url.full = %url,
                 peer.service = %replication_target_label(&message.target),
@@ -200,17 +200,17 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
             .instrument(request_span)
             .await
         }
-        ReplicationOperation::DeleteProject { project_handle } => {
+        ReplicationOperation::DeleteNamespace { namespace_id } => {
             let url = format!(
-                "{}/_internal/replicate/project?project_handle={}",
+                "{}/_internal/replicate/namespace?namespace_id={}",
                 message.target,
-                url_encode(project_handle),
+                url_encode(namespace_id),
             );
             let request_span = tracing::info_span!(
                 "replication.request",
-                otel.name = "DELETE /_internal/replicate/project",
+                otel.name = "DELETE /_internal/replicate/namespace",
                 otel.kind = "client",
-                cache.operation = "delete_project",
+                kura.operation = "delete_namespace",
                 http.request.method = "DELETE",
                 url.full = %url,
                 peer.service = %replication_target_label(&message.target),
@@ -228,7 +228,7 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
                     .headers(headers)
                     .send()
                     .await
-                    .map_err(|error| format!("project replication request failed: {error}"))?;
+                    .map_err(|error| format!("namespace replication request failed: {error}"))?;
                 response_span.record("http.response.status_code", response.status().as_u16());
                 if response.status().is_server_error() {
                     response_span.record("otel.status_code", "ERROR");
@@ -236,7 +236,7 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
                 response
                     .error_for_status()
                     .map(|_| ())
-                    .map_err(|error| format!("project replication response failed: {error}"))
+                    .map_err(|error| format!("namespace replication response failed: {error}"))
             }
             .instrument(request_span)
             .await
@@ -282,7 +282,7 @@ mod tests {
             .store
             .persist_artifact_from_bytes(
                 ArtifactKind::Xcode,
-                "project",
+                "namespace",
                 "artifact",
                 "application/octet-stream",
                 b"hello",
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_outbox_replicates_artifacts_and_project_deletes() {
+    async fn process_outbox_replicates_artifacts_and_namespace_deletes() {
         let remote = test_context(|_| {}).await;
         let (remote_url, _server) = spawn_server(router(remote.state.clone())).await;
 
@@ -325,7 +325,7 @@ mod tests {
                 target: remote_url.clone(),
                 operation: ReplicationOperation::UpsertArtifact {
                     kind: ArtifactKind::Gradle,
-                    project_handle: "ios".into(),
+                    namespace_id: "ios".into(),
                     key: "artifact".into(),
                     content_type: "application/octet-stream".into(),
                     artifact_id: local
@@ -344,8 +344,8 @@ mod tests {
             .store
             .enqueue(OutboxMessage {
                 target: remote_url,
-                operation: ReplicationOperation::DeleteProject {
-                    project_handle: "android".into(),
+                operation: ReplicationOperation::DeleteNamespace {
+                    namespace_id: "android".into(),
                 },
             })
             .expect("delete should enqueue");

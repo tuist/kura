@@ -36,7 +36,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/cache/module/start", post(start_module_upload))
         .route("/api/cache/module/part", post(upload_module_part))
         .route("/api/cache/module/complete", post(complete_module_upload))
-        .route("/api/cache/clean", delete(clean_project))
+        .route("/api/cache/clean", delete(clean_namespace))
         .route(
             "/api/cache/gradle/{cache_key}",
             get(get_gradle).put(put_gradle),
@@ -47,8 +47,8 @@ pub fn router(state: SharedState) -> Router {
             put(internal_replicate_artifact),
         )
         .route(
-            "/_internal/replicate/project",
-            delete(internal_delete_project),
+            "/_internal/replicate/namespace",
+            delete(internal_delete_namespace),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -58,23 +58,23 @@ pub fn router(state: SharedState) -> Router {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ProjectQuery {
-    account_handle: String,
-    project_handle: String,
+struct NamespaceQuery {
+    tenant_id: String,
+    namespace_id: String,
 }
 
-impl ProjectQuery {
+impl NamespaceQuery {
     fn from_params(params: &HashMap<String, String>) -> Result<Self, String> {
         Ok(Self {
-            account_handle: required_param(params, "account_handle")?,
-            project_handle: required_param(params, "project_handle")?,
+            tenant_id: required_param(params, "tenant_id")?,
+            namespace_id: required_param(params, "namespace_id")?,
         })
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct ModuleQuery {
-    project: ProjectQuery,
+    namespace: NamespaceQuery,
     cache_category: String,
     hash: String,
     name: String,
@@ -83,7 +83,7 @@ struct ModuleQuery {
 impl ModuleQuery {
     fn from_params(params: &HashMap<String, String>) -> Result<Self, String> {
         Ok(Self {
-            project: ProjectQuery::from_params(params)?,
+            namespace: NamespaceQuery::from_params(params)?,
             cache_category: params
                 .get("cache_category")
                 .cloned()
@@ -151,7 +151,7 @@ impl UploadIdQuery {
 #[derive(Debug, PartialEq, Eq)]
 struct ReplicateArtifactQuery {
     kind: String,
-    project_handle: String,
+    namespace_id: String,
     key: String,
     content_type: String,
 }
@@ -160,7 +160,7 @@ impl ReplicateArtifactQuery {
     fn from_params(params: &HashMap<String, String>) -> Result<Self, String> {
         Ok(Self {
             kind: required_param(params, "kind")?,
-            project_handle: required_param(params, "project_handle")?,
+            namespace_id: required_param(params, "namespace_id")?,
             key: required_param(params, "key")?,
             content_type: required_param(params, "content_type")?,
         })
@@ -220,7 +220,7 @@ async fn up(State(state): State<SharedState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "ok",
-        "account": state.config.account.clone(),
+        "tenant_id": state.config.tenant_id.clone(),
         "region": state.config.region.clone(),
         "node": state.config.region.clone(),
         "connected_nodes": all_members.iter().cloned().filter(|region| region != &state.config.region).collect::<Vec<_>>(),
@@ -244,15 +244,15 @@ async fn get_keyvalue(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
     get_artifact(
         state,
         ArtifactKind::Keyvalue,
-        &project.project_handle,
+        &namespace.namespace_id,
         &cas_id,
     )
     .await
@@ -263,8 +263,8 @@ async fn put_keyvalue(
     State(state): State<SharedState>,
     Json(body): Json<KeyValuePutRequest>,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
@@ -277,7 +277,7 @@ async fn put_keyvalue(
 
     match state.store.persist_artifact_from_bytes(
         ArtifactKind::Keyvalue,
-        &project.project_handle,
+        &namespace.namespace_id,
         &cas_id,
         "application/json",
         payload_bytes.as_bytes(),
@@ -306,12 +306,12 @@ async fn get_xcode(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    get_artifact(state, ArtifactKind::Xcode, &project.project_handle, &id).await
+    get_artifact(state, ArtifactKind::Xcode, &namespace.namespace_id, &id).await
 }
 
 async fn put_xcode(
@@ -320,15 +320,15 @@ async fn put_xcode(
     State(state): State<SharedState>,
     request: Request,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
     put_blob_artifact(
         state,
         ArtifactKind::Xcode,
-        &project.project_handle,
+        &namespace.namespace_id,
         &id,
         request,
         MAX_XCODE_BYTES,
@@ -342,15 +342,15 @@ async fn get_gradle(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
     get_artifact(
         state,
         ArtifactKind::Gradle,
-        &project.project_handle,
+        &namespace.namespace_id,
         &cache_key,
     )
     .await
@@ -362,15 +362,15 @@ async fn put_gradle(
     State(state): State<SharedState>,
     request: Request,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
     put_blob_artifact(
         state,
         ArtifactKind::Gradle,
-        &project.project_handle,
+        &namespace.namespace_id,
         &cache_key,
         request,
         MAX_GRADLE_BYTES,
@@ -390,7 +390,7 @@ async fn head_module(
 
     match state.store.artifact_exists(
         ArtifactKind::Module,
-        &query.project.project_handle,
+        &query.namespace.namespace_id,
         &query.artifact_key(),
     ) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -414,7 +414,7 @@ async fn get_module(
     get_artifact(
         state,
         ArtifactKind::Module,
-        &query.project.project_handle,
+        &query.namespace.namespace_id,
         &query.artifact_key(),
     )
     .await
@@ -431,15 +431,15 @@ async fn start_module_upload(
 
     match state.store.artifact_exists(
         ArtifactKind::Module,
-        &query.project.project_handle,
+        &query.namespace.namespace_id,
         &query.artifact_key(),
     ) {
         Ok(true) => {
             Json(serde_json::json!({ "upload_id": serde_json::Value::Null })).into_response()
         }
         Ok(false) => match state.store.start_multipart_upload(
-            &query.project.account_handle,
-            &query.project.project_handle,
+            &query.namespace.tenant_id,
+            &query.namespace.namespace_id,
             &query.cache_category,
             &query.hash,
             &query.name,
@@ -559,16 +559,16 @@ async fn complete_module_upload(
     }
 }
 
-async fn clean_project(
+async fn clean_namespace(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Response {
-    let project = match ProjectQuery::from_params(&params) {
-        Ok(project) => project,
+    let namespace = match NamespaceQuery::from_params(&params) {
+        Ok(namespace) => namespace,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.delete_project(&project.project_handle) {
+    match state.store.delete_namespace(&namespace.namespace_id) {
         Ok(()) => {
             for peer in state
                 .config
@@ -578,11 +578,11 @@ async fn clean_project(
             {
                 if let Err(error) = state.store.enqueue(OutboxMessage {
                     target: peer.clone(),
-                    operation: ReplicationOperation::DeleteProject {
-                        project_handle: project.project_handle.clone(),
+                    operation: ReplicationOperation::DeleteNamespace {
+                        namespace_id: namespace.namespace_id.clone(),
                     },
                 }) {
-                    tracing::warn!("failed to enqueue project delete for {peer}: {error}");
+                    tracing::warn!("failed to enqueue namespace delete for {peer}: {error}");
                 }
             }
             state.notify.notify_one();
@@ -598,7 +598,7 @@ async fn clean_project(
 async fn internal_status(State(state): State<SharedState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "region": state.config.region.clone(),
-        "account": state.config.account.clone(),
+        "tenant_id": state.config.tenant_id.clone(),
     }))
 }
 
@@ -637,7 +637,7 @@ async fn internal_replicate_artifact(
 
     match state.store.persist_artifact_from_path(
         kind,
-        &query.project_handle,
+        &query.namespace_id,
         &query.key,
         &query.content_type,
         &temp.path,
@@ -650,20 +650,20 @@ async fn internal_replicate_artifact(
     }
 }
 
-async fn internal_delete_project(
+async fn internal_delete_namespace(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Response {
-    let project_handle = match required_param(&params, "project_handle") {
-        Ok(project_handle) => project_handle,
+    let namespace_id = match required_param(&params, "namespace_id") {
+        Ok(namespace_id) => namespace_id,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.delete_project(&project_handle) {
+    match state.store.delete_namespace(&namespace_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete replicated project: {error}"),
+            format!("Failed to delete replicated namespace: {error}"),
         ),
     }
 }
@@ -671,10 +671,10 @@ async fn internal_delete_project(
 async fn get_artifact(
     state: SharedState,
     kind: ArtifactKind,
-    project_handle: &str,
+    namespace_id: &str,
     key: &str,
 ) -> Response {
-    match state.store.fetch_artifact(kind, project_handle, key) {
+    match state.store.fetch_artifact(kind, namespace_id, key) {
         Ok(Some(manifest)) => {
             state
                 .metrics
@@ -698,13 +698,13 @@ async fn get_artifact(
 async fn put_blob_artifact(
     state: SharedState,
     kind: ArtifactKind,
-    project_handle: &str,
+    namespace_id: &str,
     key: &str,
     request: Request,
     max_bytes: u64,
     success_status: StatusCode,
 ) -> Response {
-    match state.store.artifact_exists(kind, project_handle, key) {
+    match state.store.artifact_exists(kind, namespace_id, key) {
         Ok(true) => return success_status.into_response(),
         Ok(false) => {}
         Err(error) => {
@@ -735,7 +735,7 @@ async fn put_blob_artifact(
 
     match state.store.persist_artifact_from_path(
         kind,
-        project_handle,
+        namespace_id,
         key,
         "application/octet-stream",
         &temp.path,
@@ -827,7 +827,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/api/cache/keyvalue?account_handle=acme&project_handle=ios")
+                    .uri("/api/cache/keyvalue?tenant_id=acme&namespace_id=ios")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"cas_id":"cas-1","entries":[{"value":"hello"},{"value":"world"}]}"#,
@@ -841,7 +841,7 @@ mod tests {
         let get_response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/cache/keyvalue/cas-1?account_handle=acme&project_handle=ios")
+                    .uri("/api/cache/keyvalue/cas-1?tenant_id=acme&namespace_id=ios")
                     .body(Body::empty())
                     .expect("failed to build get request"),
             )
@@ -866,7 +866,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/cache/module/start?account_handle=acme&project_handle=ios&hash=hash-1&name=Module.framework&cache_category=builds")
+                    .uri("/api/cache/module/start?tenant_id=acme&namespace_id=ios&hash=hash-1&name=Module.framework&cache_category=builds")
                     .body(Body::empty())
                     .expect("failed to build start request"),
             )
@@ -921,7 +921,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("HEAD")
-                    .uri("/api/cache/module/module-1?account_handle=acme&project_handle=ios&hash=hash-1&name=Module.framework&cache_category=builds")
+                    .uri("/api/cache/module/module-1?tenant_id=acme&namespace_id=ios&hash=hash-1&name=Module.framework&cache_category=builds")
                     .body(Body::empty())
                     .expect("failed to build head request"),
             )
@@ -932,7 +932,7 @@ mod tests {
         let get = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/cache/module/module-1?account_handle=acme&project_handle=ios&hash=hash-1&name=Module.framework&cache_category=builds")
+                    .uri("/api/cache/module/module-1?tenant_id=acme&namespace_id=ios&hash=hash-1&name=Module.framework&cache_category=builds")
                     .body(Body::empty())
                     .expect("failed to build get request"),
             )
@@ -949,7 +949,7 @@ mod tests {
         let response = router(context.state.clone())
             .oneshot(
                 Request::builder()
-                    .uri("/api/cache/keyvalue/cas-1?project_handle=ios")
+                    .uri("/api/cache/keyvalue/cas-1?namespace_id=ios")
                     .body(Body::empty())
                     .expect("failed to build request"),
             )
@@ -960,12 +960,12 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&response_text(response).await)
                 .expect("failed to decode error response")["message"],
-            "Missing account_handle"
+            "Missing tenant_id"
         );
     }
 
     #[tokio::test]
-    async fn clean_project_removes_existing_artifacts() {
+    async fn clean_namespace_removes_existing_artifacts() {
         let context = test_context(|_| {}).await;
         context
             .state
@@ -986,7 +986,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/api/cache/clean?account_handle=acme&project_handle=ios")
+                    .uri("/api/cache/clean?tenant_id=acme&namespace_id=ios")
                     .body(Body::empty())
                     .expect("failed to build delete request"),
             )
@@ -997,7 +997,7 @@ mod tests {
         let get = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios")
+                    .uri("/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios")
                     .body(Body::empty())
                     .expect("failed to build get request"),
             )

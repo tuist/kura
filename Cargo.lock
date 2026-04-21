@@ -148,34 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cache"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "futures-util",
- "hex",
- "http-body-util",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "prometheus-client",
- "reqwest",
- "rocksdb",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -772,6 +744,34 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kura"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "prometheus-client",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

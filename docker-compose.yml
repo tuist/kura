@@ -1,52 +1,52 @@
 services:
-  cache-us:
+  kura-us:
     build:
       context: .
       dockerfile: Dockerfile
-    hostname: cache-us
-    domainname: cache.internal
-    environment: &cache_env
-      TUIST_CACHE_PORT: "4000"
-      TUIST_CACHE_ACCOUNT_HANDLE: default
-      TUIST_CACHE_TMP_DIR: /tmp/cache
-      TUIST_CACHE_DATA_DIR: /var/cache/cache
-      TUIST_CACHE_REGION: us-east
-      TUIST_CACHE_NODE_URL: http://cache-us.cache.internal:4000
-      TUIST_CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
-      TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
-      TUIST_CACHE_OTEL_SERVICE_NAME: cache-us
-      TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT: local
+    hostname: kura-us
+    domainname: kura.internal
+    environment: &kura_env
+      KURA_PORT: "4000"
+      KURA_TENANT_ID: default
+      KURA_TMP_DIR: /tmp/kura
+      KURA_DATA_DIR: /var/cache/kura
+      KURA_REGION: us-east
+      KURA_NODE_URL: http://kura-us.kura.internal:4000
+      KURA_PEERS: http://kura-us.kura.internal:4000,http://kura-eu.kura.internal:4000,http://kura-ap.kura.internal:4000
+      KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
+      KURA_OTEL_SERVICE_NAME: kura-us
+      KURA_OTEL_DEPLOYMENT_ENVIRONMENT: local
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 18
     labels:
-      cache.region: us-east
-      cache.account: default
+      kura.region: us-east
+      kura.tenant_id: default
     ports:
-      - "${CACHE_US_PORT:-4101}:4000"
+      - "${KURA_US_PORT:-4101}:4000"
     volumes:
-      - cache-us-data:/var/cache/cache
+      - kura-us-data:/var/cache/kura
     networks:
       default:
         aliases:
-          - cache-us.cache.internal
+          - kura-us.kura.internal
 
-  cache-eu:
+  kura-eu:
     build:
       context: .
       dockerfile: Dockerfile
-    hostname: cache-eu
-    domainname: cache.internal
+    hostname: kura-eu
+    domainname: kura.internal
     environment:
-      <<: *cache_env
-      TUIST_CACHE_REGION: eu-west
-      TUIST_CACHE_NODE_URL: http://cache-eu.cache.internal:4000
-      TUIST_CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
-      TUIST_CACHE_OTEL_SERVICE_NAME: cache-eu
+      <<: *kura_env
+      KURA_REGION: eu-west
+      KURA_NODE_URL: http://kura-eu.kura.internal:4000
+      KURA_PEERS: http://kura-us.kura.internal:4000,http://kura-eu.kura.internal:4000,http://kura-ap.kura.internal:4000
+      KURA_OTEL_SERVICE_NAME: kura-eu
     depends_on:
-      cache-us:
+      kura-us:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
@@ -54,31 +54,31 @@ services:
       timeout: 5s
       retries: 18
     labels:
-      cache.region: eu-west
-      cache.account: default
+      kura.region: eu-west
+      kura.tenant_id: default
     ports:
-      - "${CACHE_EU_PORT:-4102}:4000"
+      - "${KURA_EU_PORT:-4102}:4000"
     volumes:
-      - cache-eu-data:/var/cache/cache
+      - kura-eu-data:/var/cache/kura
     networks:
       default:
         aliases:
-          - cache-eu.cache.internal
+          - kura-eu.kura.internal
 
-  cache-ap:
+  kura-ap:
     build:
       context: .
       dockerfile: Dockerfile
-    hostname: cache-ap
-    domainname: cache.internal
+    hostname: kura-ap
+    domainname: kura.internal
     environment:
-      <<: *cache_env
-      TUIST_CACHE_REGION: ap-south
-      TUIST_CACHE_NODE_URL: http://cache-ap.cache.internal:4000
-      TUIST_CACHE_PEERS: http://cache-us.cache.internal:4000,http://cache-eu.cache.internal:4000,http://cache-ap.cache.internal:4000
-      TUIST_CACHE_OTEL_SERVICE_NAME: cache-ap
+      <<: *kura_env
+      KURA_REGION: ap-south
+      KURA_NODE_URL: http://kura-ap.kura.internal:4000
+      KURA_PEERS: http://kura-us.kura.internal:4000,http://kura-eu.kura.internal:4000,http://kura-ap.kura.internal:4000
+      KURA_OTEL_SERVICE_NAME: kura-ap
     depends_on:
-      cache-eu:
+      kura-eu:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:4000/up >/dev/null"]
@@ -86,16 +86,16 @@ services:
       timeout: 5s
       retries: 18
     labels:
-      cache.region: ap-south
-      cache.account: default
+      kura.region: ap-south
+      kura.tenant_id: default
     ports:
-      - "${CACHE_AP_PORT:-4103}:4000"
+      - "${KURA_AP_PORT:-4103}:4000"
     volumes:
-      - cache-ap-data:/var/cache/cache
+      - kura-ap-data:/var/cache/kura
     networks:
       default:
         aliases:
-          - cache-ap.cache.internal
+          - kura-ap.kura.internal
 
   prometheus:
     image: prom/prometheus:v3.11.2
@@ -151,6 +151,6 @@ services:
       - ./ops/grafana/dashboards:/etc/grafana/dashboards:ro
 
 volumes:
-  cache-us-data:
-  cache-eu-data:
-  cache-ap-data:
+  kura-us-data:
+  kura-eu-data:
+  kura-ap-data:

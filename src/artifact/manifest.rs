@@ -6,7 +6,7 @@ use crate::artifact::kind::ArtifactKind;
 pub struct ArtifactManifest {
     pub artifact_id: String,
     pub kind: ArtifactKind,
-    pub project_handle: String,
+    pub namespace_id: String,
     pub key: String,
     pub content_type: String,
     pub blob_path: String,

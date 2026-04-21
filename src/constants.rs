@@ -6,6 +6,6 @@ pub const REPLICATION_RETRY_SECS: u64 = 2;
 
 pub const ROCKSDB_CF_MANIFESTS: &str = "manifests";
 // Keep the on-disk column family name stable to avoid migrating existing data.
-pub const ROCKSDB_CF_PROJECT_ARTIFACTS: &str = "project_artifacts";
+pub const ROCKSDB_CF_NAMESPACE_ARTIFACTS: &str = "project_artifacts";
 pub const ROCKSDB_CF_MULTIPART_UPLOADS: &str = "multipart_uploads";
 pub const ROCKSDB_CF_OUTBOX: &str = "outbox";

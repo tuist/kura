@@ -1,13 +1,13 @@
-# cache
+# Kura
 
-`cache` is a Rust server for building low-latency cache meshes for accounts, handling distributed cache traffic for binary artifacts and metadata.
+`Kura` is a Rust server for building low-latency cache meshes for tenants, handling distributed cache traffic for binary artifacts and metadata.
 
 ## Summary ✨
 
 - ⚡ Hot reads come from local disk
 - 🪨 Local metadata, multipart state, and the replication outbox live in RocksDB
 - 🔁 Blobs and cache metadata replicate to peer nodes with eventual consistency
-- 📦 The HTTP API covers key value entries, Xcode CAS artifacts, Gradle artifacts, multipart module uploads, and project clean
+- 📦 The HTTP API covers key value entries, Xcode CAS artifacts, Gradle artifacts, multipart module uploads, and namespace clean
 - 📊 The local stack includes Grafana, Prometheus, Loki, Promtail, and Tempo traces
 
 ## Local stack 🧪

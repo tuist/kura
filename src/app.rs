@@ -30,7 +30,7 @@ pub async fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to create directories: {error}"))?;
 
     let store = Store::open(&config)?;
-    let metrics = Metrics::new(config.region.clone(), config.account.clone());
+    let metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
     let members = RwLock::new(BTreeSet::new());
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -52,7 +52,7 @@ pub async fn run() -> Result<(), String> {
 
     let router = http::router(state.clone());
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.port));
-    info!("cache Rust service listening on {address}");
+    info!("Kura service listening on {address}");
 
     let listener = tokio::net::TcpListener::bind(address)
         .await

@@ -30,7 +30,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(region: String, account: String) -> Self {
+    pub fn new(region: String, tenant_id: String) -> Self {
         let mut registry = Registry::default();
 
         let http_requests = Family::<HttpRequestLabels, Counter>::default();
@@ -52,58 +52,58 @@ impl Metrics {
         let node_info = Family::<NodeInfoLabels, Gauge>::default();
 
         registry.register(
-            "cache_http_requests_total",
+            "kura_http_requests_total",
             "HTTP requests by route and status code",
             http_requests.clone(),
         );
         registry.register(
-            "cache_http_request_duration_seconds",
+            "kura_http_request_duration_seconds",
             "HTTP request latency by route",
             http_request_duration.clone(),
         );
         registry.register(
-            "cache_http_exceptions_total",
+            "kura_http_exceptions_total",
             "HTTP exceptions by route and class",
             http_exceptions.clone(),
         );
         registry.register(
-            "cache_artifact_reads_total",
+            "kura_artifact_reads_total",
             "Artifact reads by kind and result",
             artifact_reads.clone(),
         );
         registry.register(
-            "cache_artifact_writes_total",
+            "kura_artifact_writes_total",
             "Artifact writes by kind and result",
             artifact_writes.clone(),
         );
         registry.register(
-            "cache_artifact_read_bytes_total",
+            "kura_artifact_read_bytes_total",
             "Artifact read throughput by kind and result",
             artifact_read_bytes.clone(),
         );
         registry.register(
-            "cache_artifact_write_bytes_total",
+            "kura_artifact_write_bytes_total",
             "Artifact write throughput by kind and result",
             artifact_write_bytes.clone(),
         );
         registry.register(
-            "cache_replication_requests_total",
+            "kura_replication_requests_total",
             "Peer replication requests by target, operation, and result",
             replication_requests.clone(),
         );
         registry.register(
-            "cache_replication_request_duration_seconds",
+            "kura_replication_request_duration_seconds",
             "Peer replication request latency by target and operation",
             replication_request_duration.clone(),
         );
         registry.register(
-            "cache_multipart_parts_total",
+            "kura_multipart_parts_total",
             "Multipart part uploads by result",
             multipart_parts.clone(),
         );
         registry.register(
-            "cache_node_info",
-            "Node info labels for each cache region",
+            "kura_node_info",
+            "Node info labels for each Kura region",
             node_info.clone(),
         );
 
@@ -124,7 +124,7 @@ impl Metrics {
 
         metrics
             .node_info
-            .get_or_create(&NodeInfoLabels { region, account })
+            .get_or_create(&NodeInfoLabels { region, tenant_id })
             .set(1);
 
         metrics
@@ -269,7 +269,7 @@ struct MultipartLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct NodeInfoLabels {
     region: String,
-    account: String,
+    tenant_id: String,
 }
 
 #[cfg(test)]
@@ -294,7 +294,7 @@ mod tests {
         metrics.record_artifact_read(ArtifactKind::Xcode, "ok", 5);
         metrics.record_artifact_write(ArtifactKind::Module, "ok", 10);
         metrics.record_replication(
-            "https://cache.example.com/internal",
+            "https://kura.example.com/internal",
             "upsert_artifact",
             "ok",
             Duration::from_millis(5),
@@ -303,14 +303,14 @@ mod tests {
 
         let rendered = metrics.render();
 
-        assert!(rendered.contains("cache_http_requests_total"));
-        assert!(rendered.contains("cache_http_exceptions_total"));
-        assert!(rendered.contains("cache_artifact_reads_total"));
-        assert!(rendered.contains("cache_artifact_write_bytes_total"));
-        assert!(rendered.contains("cache_replication_requests_total"));
-        assert!(rendered.contains("cache_multipart_parts_total"));
-        assert!(rendered.contains("cache_node_info"));
+        assert!(rendered.contains("kura_http_requests_total"));
+        assert!(rendered.contains("kura_http_exceptions_total"));
+        assert!(rendered.contains("kura_artifact_reads_total"));
+        assert!(rendered.contains("kura_artifact_write_bytes_total"));
+        assert!(rendered.contains("kura_replication_requests_total"));
+        assert!(rendered.contains("kura_multipart_parts_total"));
+        assert!(rendered.contains("kura_node_info"));
         assert!(rendered.contains("region=\"eu-west\""));
-        assert!(rendered.contains("account=\"acme\""));
+        assert!(rendered.contains("tenant_id=\"acme\""));
     }
 }

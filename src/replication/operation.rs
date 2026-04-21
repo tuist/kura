@@ -7,13 +7,13 @@ use crate::artifact::kind::ArtifactKind;
 pub enum ReplicationOperation {
     UpsertArtifact {
         kind: ArtifactKind,
-        project_handle: String,
+        namespace_id: String,
         key: String,
         content_type: String,
         artifact_id: String,
     },
-    DeleteProject {
-        project_handle: String,
+    DeleteNamespace {
+        namespace_id: String,
     },
 }
 
@@ -21,7 +21,7 @@ impl ReplicationOperation {
     pub fn name(&self) -> &'static str {
         match self {
             Self::UpsertArtifact { .. } => "upsert_artifact",
-            Self::DeleteProject { .. } => "delete_project",
+            Self::DeleteNamespace { .. } => "delete_namespace",
         }
     }
 }
@@ -37,7 +37,7 @@ mod tests {
         assert_eq!(
             ReplicationOperation::UpsertArtifact {
                 kind: ArtifactKind::Xcode,
-                project_handle: "ios".into(),
+                namespace_id: "ios".into(),
                 key: "artifact".into(),
                 content_type: "application/octet-stream".into(),
                 artifact_id: "artifact-id".into(),
@@ -46,11 +46,11 @@ mod tests {
             "upsert_artifact"
         );
         assert_eq!(
-            ReplicationOperation::DeleteProject {
-                project_handle: "ios".into()
+            ReplicationOperation::DeleteNamespace {
+                namespace_id: "ios".into()
             }
             .name(),
-            "delete_project"
+            "delete_namespace"
         );
     }
 }

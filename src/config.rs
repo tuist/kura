@@ -2,22 +2,21 @@ use std::path::PathBuf;
 
 use tokio::fs;
 
-const TUIST_CACHE_PORT: &str = "TUIST_CACHE_PORT";
-const TUIST_CACHE_ACCOUNT_HANDLE: &str = "TUIST_CACHE_ACCOUNT_HANDLE";
-const TUIST_CACHE_REGION: &str = "TUIST_CACHE_REGION";
-const TUIST_CACHE_TMP_DIR: &str = "TUIST_CACHE_TMP_DIR";
-const TUIST_CACHE_DATA_DIR: &str = "TUIST_CACHE_DATA_DIR";
-const TUIST_CACHE_NODE_URL: &str = "TUIST_CACHE_NODE_URL";
-const TUIST_CACHE_PEERS: &str = "TUIST_CACHE_PEERS";
-const TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str =
-    "TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
-const TUIST_CACHE_OTEL_SERVICE_NAME: &str = "TUIST_CACHE_OTEL_SERVICE_NAME";
-const TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT: &str = "TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT";
+const KURA_PORT: &str = "KURA_PORT";
+const KURA_TENANT_ID: &str = "KURA_TENANT_ID";
+const KURA_REGION: &str = "KURA_REGION";
+const KURA_TMP_DIR: &str = "KURA_TMP_DIR";
+const KURA_DATA_DIR: &str = "KURA_DATA_DIR";
+const KURA_NODE_URL: &str = "KURA_NODE_URL";
+const KURA_PEERS: &str = "KURA_PEERS";
+const KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+const KURA_OTEL_SERVICE_NAME: &str = "KURA_OTEL_SERVICE_NAME";
+const KURA_OTEL_DEPLOYMENT_ENVIRONMENT: &str = "KURA_OTEL_DEPLOYMENT_ENVIRONMENT";
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
-    pub account: String,
+    pub tenant_id: String,
     pub region: String,
     pub tmp_dir: PathBuf,
     pub data_dir: PathBuf,
@@ -41,23 +40,21 @@ impl Config {
         let mut invalid = Vec::new();
 
         let port =
-            required_value(&mut lookup, TUIST_CACHE_PORT, &mut missing).and_then(
-                |value| match value.parse::<u16>() {
+            required_value(&mut lookup, KURA_PORT, &mut missing).and_then(|value| {
+                match value.parse::<u16>() {
                     Ok(port) => Some(port),
                     Err(_) => {
-                        invalid.push(format!("{TUIST_CACHE_PORT} must be a valid u16"));
+                        invalid.push(format!("{KURA_PORT} must be a valid u16"));
                         None
                     }
-                },
-            );
-        let account = required_value(&mut lookup, TUIST_CACHE_ACCOUNT_HANDLE, &mut missing);
-        let region = required_value(&mut lookup, TUIST_CACHE_REGION, &mut missing);
-        let tmp_dir =
-            required_value(&mut lookup, TUIST_CACHE_TMP_DIR, &mut missing).map(PathBuf::from);
-        let data_dir =
-            required_value(&mut lookup, TUIST_CACHE_DATA_DIR, &mut missing).map(PathBuf::from);
-        let node_url = required_value(&mut lookup, TUIST_CACHE_NODE_URL, &mut missing);
-        let peers = required_value(&mut lookup, TUIST_CACHE_PEERS, &mut missing).map(|value| {
+                }
+            });
+        let tenant_id = required_value(&mut lookup, KURA_TENANT_ID, &mut missing);
+        let region = required_value(&mut lookup, KURA_REGION, &mut missing);
+        let tmp_dir = required_value(&mut lookup, KURA_TMP_DIR, &mut missing).map(PathBuf::from);
+        let data_dir = required_value(&mut lookup, KURA_DATA_DIR, &mut missing).map(PathBuf::from);
+        let node_url = required_value(&mut lookup, KURA_NODE_URL, &mut missing);
+        let peers = required_value(&mut lookup, KURA_PEERS, &mut missing).map(|value| {
             value
                 .split(',')
                 .map(str::trim)
@@ -67,16 +64,12 @@ impl Config {
         });
         let otlp_traces_endpoint = required_value(
             &mut lookup,
-            TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
             &mut missing,
         );
-        let otel_service_name =
-            required_value(&mut lookup, TUIST_CACHE_OTEL_SERVICE_NAME, &mut missing);
-        let otel_deployment_environment = required_value(
-            &mut lookup,
-            TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT,
-            &mut missing,
-        );
+        let otel_service_name = required_value(&mut lookup, KURA_OTEL_SERVICE_NAME, &mut missing);
+        let otel_deployment_environment =
+            required_value(&mut lookup, KURA_OTEL_DEPLOYMENT_ENVIRONMENT, &mut missing);
 
         if !missing.is_empty() || !invalid.is_empty() {
             let mut errors = Vec::new();
@@ -92,7 +85,7 @@ impl Config {
 
         Ok(Self {
             port: port.expect("port should be present when configuration is valid"),
-            account: account.expect("account should be present when configuration is valid"),
+            tenant_id: tenant_id.expect("tenant_id should be present when configuration is valid"),
             region: region.expect("region should be present when configuration is valid"),
             tmp_dir: tmp_dir.expect("tmp_dir should be present when configuration is valid"),
             data_dir: data_dir.expect("data_dir should be present when configuration is valid"),
@@ -153,81 +146,81 @@ mod tests {
     fn from_lookup_reports_all_missing_variables() {
         let error = Config::from_lookup(|_| None).expect_err("expected missing config to fail");
 
-        assert!(error.contains(TUIST_CACHE_PORT));
-        assert!(error.contains(TUIST_CACHE_ACCOUNT_HANDLE));
-        assert!(error.contains(TUIST_CACHE_REGION));
-        assert!(error.contains(TUIST_CACHE_TMP_DIR));
-        assert!(error.contains(TUIST_CACHE_DATA_DIR));
-        assert!(error.contains(TUIST_CACHE_NODE_URL));
-        assert!(error.contains(TUIST_CACHE_PEERS));
-        assert!(error.contains(TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT));
-        assert!(error.contains(TUIST_CACHE_OTEL_SERVICE_NAME));
-        assert!(error.contains(TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT));
+        assert!(error.contains(KURA_PORT));
+        assert!(error.contains(KURA_TENANT_ID));
+        assert!(error.contains(KURA_REGION));
+        assert!(error.contains(KURA_TMP_DIR));
+        assert!(error.contains(KURA_DATA_DIR));
+        assert!(error.contains(KURA_NODE_URL));
+        assert!(error.contains(KURA_PEERS));
+        assert!(error.contains(KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT));
+        assert!(error.contains(KURA_OTEL_SERVICE_NAME));
+        assert!(error.contains(KURA_OTEL_DEPLOYMENT_ENVIRONMENT));
     }
 
     #[test]
     fn from_lookup_parses_overrides() {
         let config = config_from(&[
-            (TUIST_CACHE_PORT, "4500"),
-            (TUIST_CACHE_ACCOUNT_HANDLE, "acme"),
-            (TUIST_CACHE_REGION, "eu_west"),
-            (TUIST_CACHE_TMP_DIR, "/tmp/cache"),
-            (TUIST_CACHE_DATA_DIR, "/tmp/cache-data"),
-            (TUIST_CACHE_NODE_URL, "https://cache.example.com"),
+            (KURA_PORT, "4500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com"),
             (
-                TUIST_CACHE_PEERS,
-                "https://cache-a.example.com, https://cache-b.example.com",
+                KURA_PEERS,
+                "https://kura-a.example.com, https://kura-b.example.com",
             ),
             (
-                TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
             ),
-            (TUIST_CACHE_OTEL_SERVICE_NAME, "cache-eu"),
-            (TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
         ])
         .expect("expected config overrides to parse");
 
         assert_eq!(config.port, 4500);
-        assert_eq!(config.account, "acme");
+        assert_eq!(config.tenant_id, "acme");
         assert_eq!(config.region, "eu_west");
-        assert_eq!(config.tmp_dir, PathBuf::from("/tmp/cache"));
-        assert_eq!(config.data_dir, PathBuf::from("/tmp/cache-data"));
-        assert_eq!(config.node_url, "https://cache.example.com");
+        assert_eq!(config.tmp_dir, PathBuf::from("/tmp/kura"));
+        assert_eq!(config.data_dir, PathBuf::from("/tmp/kura-data"));
+        assert_eq!(config.node_url, "https://kura.example.com");
         assert_eq!(
             config.peers,
             vec![
-                "https://cache-a.example.com".to_owned(),
-                "https://cache-b.example.com".to_owned()
+                "https://kura-a.example.com".to_owned(),
+                "https://kura-b.example.com".to_owned()
             ]
         );
         assert_eq!(
             config.otlp_traces_endpoint,
             "https://otel.example.com/v1/traces"
         );
-        assert_eq!(config.otel_service_name, "cache-eu");
+        assert_eq!(config.otel_service_name, "kura-eu");
         assert_eq!(config.otel_deployment_environment, "staging");
     }
 
     #[test]
     fn from_lookup_reports_invalid_port() {
         let error = config_from(&[
-            (TUIST_CACHE_PORT, "invalid"),
-            (TUIST_CACHE_ACCOUNT_HANDLE, "acme"),
-            (TUIST_CACHE_REGION, "eu_west"),
-            (TUIST_CACHE_TMP_DIR, "/tmp/cache"),
-            (TUIST_CACHE_DATA_DIR, "/tmp/cache-data"),
-            (TUIST_CACHE_NODE_URL, "https://cache.example.com"),
-            (TUIST_CACHE_PEERS, "https://cache-a.example.com"),
+            (KURA_PORT, "invalid"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com"),
+            (KURA_PEERS, "https://kura-a.example.com"),
             (
-                TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
             ),
-            (TUIST_CACHE_OTEL_SERVICE_NAME, "cache-eu"),
-            (TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
         ])
         .expect_err("expected invalid port to fail");
 
-        assert!(error.contains(TUIST_CACHE_PORT));
+        assert!(error.contains(KURA_PORT));
         assert!(error.contains("valid u16"));
     }
 
@@ -235,19 +228,19 @@ mod tests {
     async fn ensure_directories_creates_expected_layout() {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let mut config = config_from(&[
-            (TUIST_CACHE_PORT, "4000"),
-            (TUIST_CACHE_ACCOUNT_HANDLE, "acme"),
-            (TUIST_CACHE_REGION, "local"),
-            (TUIST_CACHE_TMP_DIR, "/tmp/cache"),
-            (TUIST_CACHE_DATA_DIR, "/tmp/cache-data"),
-            (TUIST_CACHE_NODE_URL, "http://127.0.0.1:4000"),
-            (TUIST_CACHE_PEERS, ""),
+            (KURA_PORT, "4000"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "local"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "http://127.0.0.1:4000"),
+            (KURA_PEERS, ""),
             (
-                TUIST_CACHE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "http://127.0.0.1:4318/v1/traces",
             ),
-            (TUIST_CACHE_OTEL_SERVICE_NAME, "cache-local"),
-            (TUIST_CACHE_OTEL_DEPLOYMENT_ENVIRONMENT, "local"),
+            (KURA_OTEL_SERVICE_NAME, "kura-local"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "local"),
         ])
         .expect("expected config to parse");
         config.tmp_dir = temp_dir.path().join("tmp");
@@ -256,7 +249,7 @@ mod tests {
         config
             .ensure_directories()
             .await
-            .expect("failed to create cache directories");
+            .expect("failed to create Kura directories");
 
         assert!(config.tmp_dir.join("uploads").exists());
         assert!(config.tmp_dir.join("parts").exists());

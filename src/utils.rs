@@ -71,16 +71,16 @@ pub fn temp_file_path(directory: &Path, prefix: &str) -> PathBuf {
 
 pub fn artifact_storage_id(
     kind: ArtifactKind,
-    account: &str,
-    project_handle: &str,
+    tenant_id: &str,
+    namespace_id: &str,
     key: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(kind.as_str().as_bytes());
     hasher.update([0]);
-    hasher.update(account.as_bytes());
+    hasher.update(tenant_id.as_bytes());
     hasher.update([0]);
-    hasher.update(project_handle.as_bytes());
+    hasher.update(namespace_id.as_bytes());
     hasher.update([0]);
     hasher.update(key.as_bytes());
     hex::encode(hasher.finalize())
@@ -95,8 +95,8 @@ pub fn blob_path(data_dir: &Path, kind: ArtifactKind, artifact_id: &str) -> Path
         .join(artifact_id)
 }
 
-pub fn project_artifact_index_key(project_handle: &str, artifact_id: &str) -> String {
-    format!("{project_handle}\0{artifact_id}")
+pub fn namespace_artifact_index_key(namespace_id: &str, artifact_id: &str) -> String {
+    format!("{namespace_id}\0{artifact_id}")
 }
 
 pub fn now_ms() -> u64 {
@@ -140,9 +140,9 @@ mod tests {
 
     #[test]
     fn artifact_ids_are_stable() {
-        let a = artifact_storage_id(ArtifactKind::Xcode, "account", "ios", "abc");
-        let b = artifact_storage_id(ArtifactKind::Xcode, "account", "ios", "abc");
-        let c = artifact_storage_id(ArtifactKind::Gradle, "account", "ios", "abc");
+        let a = artifact_storage_id(ArtifactKind::Xcode, "tenant", "ios", "abc");
+        let b = artifact_storage_id(ArtifactKind::Xcode, "tenant", "ios", "abc");
+        let c = artifact_storage_id(ArtifactKind::Gradle, "tenant", "ios", "abc");
 
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -167,8 +167,8 @@ mod tests {
     #[test]
     fn replication_labels_strip_scheme_and_path() {
         assert_eq!(
-            replication_target_label("https://cache.example.com/_internal/status"),
-            "cache.example.com"
+            replication_target_label("https://kura.example.com/_internal/status"),
+            "kura.example.com"
         );
     }
 

@@ -22,12 +22,12 @@ pub fn init_tracing(config: &Config) -> Option<SdkTracerProvider> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "cache=info".into());
+        .unwrap_or_else(|_| "kura=info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     match build_tracer_provider(config, &config.otlp_traces_endpoint) {
         Ok(tracer_provider) => {
-            let tracer = tracer_provider.tracer("cache");
+            let tracer = tracer_provider.tracer("kura");
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer)
@@ -58,14 +58,14 @@ fn build_tracer_provider(config: &Config, endpoint: &str) -> Result<SdkTracerPro
     let resource = Resource::builder_empty()
         .with_attributes([
             KeyValue::new("service.name", config.otel_service_name.clone()),
-            KeyValue::new("service.namespace", "cache"),
+            KeyValue::new("service.namespace", "kura"),
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             KeyValue::new(
                 "deployment.environment.name",
                 config.otel_deployment_environment.clone(),
             ),
-            KeyValue::new("cache.region", config.region.clone()),
-            KeyValue::new("cache.account", config.account.clone()),
+            KeyValue::new("kura.region", config.region.clone()),
+            KeyValue::new("kura.tenant_id", config.tenant_id.clone()),
             KeyValue::new("service.instance.id", config.node_url.clone()),
         ])
         .build();

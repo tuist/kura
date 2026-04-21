@@ -7,8 +7,8 @@ use crate::multipart::part::MultipartPart;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultipartUpload {
     pub upload_id: String,
-    pub account_handle: String,
-    pub project_handle: String,
+    pub tenant_id: String,
+    pub namespace_id: String,
     pub category: String,
     pub hash: String,
     pub name: String,
