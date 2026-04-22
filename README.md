@@ -59,7 +59,7 @@ Run tests:
 
 ```bash
 mise x rust@1.94.1 -- cargo test
-bats test/e2e/*.bats
+mise x shellspec@0.28.1 -- shellspec
 ```
 
 Important runtime configuration:
@@ -149,8 +149,8 @@ References:
 
 - `src/http.rs`
 - `src/reapi/mod.rs`
-- `test/e2e/kura_cluster.bats`
-- `test/e2e/kura_clients.bats`
+- `spec/e2e/cluster_spec.sh`
+- `spec/e2e/clients_spec.sh`
 
 ## 🗄️ Storage And Replication
 
@@ -186,8 +186,8 @@ References:
 - `src/store.rs`
 - `src/replication/`
 - `src/peer_tls.rs`
-- `test/e2e/kura_discovery.bats`
-- `test/e2e/kura_mtls.bats`
+- `spec/e2e/discovery_spec.sh`
+- `spec/e2e/mtls_spec.sh`
 
 ## ⚙️ Runtime Model And Limits
 
@@ -417,7 +417,7 @@ The runtime keeps decision caching, metrics, timeouts, and cryptographic primiti
 References:
 
 - `src/extension/`
-- `test/e2e/kura_extension.bats`
+- `spec/e2e/extension_spec.sh`
 
 <a id="reference"></a>
 ## 📖 Reference

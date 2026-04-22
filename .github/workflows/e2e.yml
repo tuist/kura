@@ -7,29 +7,27 @@ on:
       - main
 
 jobs:
-  bats:
+  shellspec:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.94.1
+      - name: Set up mise
+        uses: jdx/mise-action@v2
 
       - name: Run unit tests
-        run: cargo test
+        run: |
+          mise trust mise.toml
+          mise install
+          mise x rust@1.94.1 -- cargo test
 
       - name: Show Docker tooling
         run: docker compose version
-
-      - name: Install Bats
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bats
 
       - name: Prebuild Docker images
         run: docker compose build
 
       - name: Run end-to-end suite
-        run: bats test/e2e/*.bats
+        run: mise x shellspec@0.28.1 -- shellspec

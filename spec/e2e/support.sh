@@ -1,69 +1,76 @@
-#!/usr/bin/env bats
+# shellcheck shell=bash
 
-setup_file() {
-  export COMPOSE_PROJECT_NAME="kura-clients"
-  export KURA_US_PORT=4401
-  export KURA_EU_PORT=4402
-  export KURA_AP_PORT=4403
-  export KURA_US_GRPC_PORT=5501
-  export KURA_EU_GRPC_PORT=5502
-  export KURA_AP_GRPC_PORT=5503
-  export KURA_US_URL="http://localhost:${KURA_US_PORT}"
-  export KURA_EU_URL="http://localhost:${KURA_EU_PORT}"
-  export KURA_AP_URL="http://localhost:${KURA_AP_PORT}"
-  dc down -v --remove-orphans >/dev/null 2>&1 || true
-  dc up --build -d kura-us kura-eu kura-ap
-
-  wait_for_http "${KURA_US_URL}/up"
-  wait_for_http "${KURA_EU_URL}/up"
-  wait_for_http "${KURA_AP_URL}/up"
-  wait_for_contains "${KURA_US_URL}/up" '"ring_members":3'
-  wait_for_contains "${KURA_EU_URL}/up" '"ring_members":3'
-  wait_for_contains "${KURA_AP_URL}/up" '"ring_members":3'
-}
-
-teardown_file() {
-  local buck2_path
-  buck2_path="$(mise exec -- which buck2 2>/dev/null || true)"
-  if [ -n "$buck2_path" ]; then
-    "$buck2_path" killall >/dev/null 2>&1 || true
-  fi
-  dc logs --no-color >"${BATS_FILE_TMPDIR}/compose.log" 2>&1 || true
-  dc down -v --remove-orphans >/dev/null 2>&1 || true
-}
+PROJECT_ROOT="${KURA_PROJECT_ROOT:?missing KURA_PROJECT_ROOT}"
 
 dc() {
-  docker compose "$@"
+  docker compose "${COMPOSE_FILES[@]}" "$@"
+}
+
+dc_container_id() {
+  dc ps -q "$1"
+}
+
+setup_suite_tmpdir() {
+  SUITE_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kura-e2e.XXXXXX")"
+}
+
+compose_teardown() {
+  if [ -n "${SUITE_TMP_DIR:-}" ] && [ -d "${SUITE_TMP_DIR}" ]; then
+    dc logs --no-color >"${SUITE_TMP_DIR}/compose.log" 2>&1 || true
+  fi
+  dc down -v --remove-orphans >/dev/null 2>&1 || true
+  if [ -n "${SUITE_TMP_DIR:-}" ] && [ -d "${SUITE_TMP_DIR}" ]; then
+    rm -rf "${SUITE_TMP_DIR}"
+  fi
+}
+
+capture_into() {
+  local __var="$1"
+  shift
+  local __output
+  __output="$("$@" 2>&1)"
+  local __status=$?
+  printf -v "$__var" '%s' "$__output"
+  return "$__status"
+}
+
+status_only() {
+  curl -sS -o /dev/null -w "%{http_code}" "$@"
 }
 
 wait_for_http() {
   local url="$1"
+  local attempts="${2:-90}"
+  local sleep_seconds="${3:-2}"
 
-  for _ in $(seq 1 90); do
+  for _ in $(seq 1 "$attempts"); do
     if curl -fsS "$url" >/dev/null 2>&1; then
       return 0
     fi
-    sleep 2
+    sleep "$sleep_seconds"
   done
 
-  echo "Timed out waiting for $url" >&2
+  printf 'Timed out waiting for %s\n' "$url" >&2
   return 1
 }
 
 wait_for_contains() {
   local url="$1"
   local needle="$2"
+  local attempts="${3:-45}"
+  local sleep_seconds="${4:-2}"
+  local body
 
-  for _ in $(seq 1 45); do
-    local body
+  for _ in $(seq 1 "$attempts"); do
     body="$(curl -fsS "$url" 2>/dev/null || true)"
     if [[ "$body" == *"$needle"* ]]; then
       printf '%s' "$body"
       return 0
     fi
-    sleep 2
+    sleep "$sleep_seconds"
   done
 
+  printf 'Timed out waiting for [%s] in %s\n' "$needle" "$url" >&2
   return 1
 }
 
@@ -71,6 +78,48 @@ new_marker() {
   python3 - <<'PY'
 import secrets
 print(secrets.token_hex(8))
+PY
+}
+
+extract_upload_id() {
+  printf '%s' "$1" | sed -E 's/.*"upload_id":"([^"]+)".*/\1/'
+}
+
+jwt_for_namespace() {
+  local namespace_id="$1"
+  python3 - "$namespace_id" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import sys
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+namespace_id = sys.argv[1]
+header = {"alg": "HS256", "typ": "JWT"}
+payload = {"sub": "user-1", "namespace_id": namespace_id, "exp": 4000000000}
+
+header_b64 = b64url(json.dumps(header, separators=(",", ":")).encode())
+payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode())
+signing_input = f"{header_b64}.{payload_b64}".encode()
+signature = hmac.new(b"extension-jwt-secret", signing_input, hashlib.sha256).digest()
+print(f"{header_b64}.{payload_b64}.{b64url(signature)}")
+PY
+}
+
+expected_signature() {
+  local payload="$1"
+  python3 - "$payload" <<'PY'
+import base64
+import hashlib
+import hmac
+import sys
+
+payload = sys.argv[1].encode()
+signature = hmac.new(b"extension-signing-secret", payload, hashlib.sha256).digest()
+print(base64.b64encode(signature).decode())
 PY
 }
 
@@ -305,99 +354,63 @@ EOF
   )
 }
 
-@test "Bazel reuses remote cache entries across regions" {
-  local marker="bazel-$(new_marker)"
-  local instance_name="bazel/${marker}"
-  local work1
-  local work2
-  work1="$(mktemp -d "${BATS_FILE_TMPDIR}/bazel-1.XXXXXX")"
-  work2="$(mktemp -d "${BATS_FILE_TMPDIR}/bazel-2.XXXXXX")"
-
-  create_bazel_workspace "$work1" "$marker"
-  create_bazel_workspace "$work2" "$marker"
-
-  run bazel_build "$work1" "$KURA_US_GRPC_PORT" "$instance_name"
-  [ "$status" -eq 0 ]
-  [[ "$output" != *"remote cache hit"* ]]
-  grep -F "$marker" "$work1/bazel-bin/hello.txt"
-
-  run bazel_build "$work2" "$KURA_EU_GRPC_PORT" "$instance_name"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"remote cache hit"* ]]
-  grep -F "$marker" "$work2/bazel-bin/hello.txt"
+kill_buck2() {
+  local buck2_path
+  buck2_path="$(mise exec -- which buck2 2>/dev/null || true)"
+  if [ -n "$buck2_path" ]; then
+    "$buck2_path" killall >/dev/null 2>&1 || true
+  fi
 }
 
-@test "Buck2 reuses REAPI cache entries across regions" {
-  local marker="buck-$(new_marker)"
-  local instance_name="buck/${marker}"
-  local work1
-  local work2
-  work1="$(mktemp -d "${BATS_FILE_TMPDIR}/buck-1.XXXXXX")"
-  work2="$(mktemp -d "${BATS_FILE_TMPDIR}/buck-2.XXXXXX")"
-
-  create_buck_workspace "$work1" "$KURA_US_GRPC_PORT" "$marker" "$instance_name"
-  create_buck_workspace "$work2" "$KURA_EU_GRPC_PORT" "$marker" "$instance_name"
-
-  run buck_build "$work1" "buck-${marker}-us"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Cache hits: 0%"* ]]
-  local output_path
-  output_path="$(printf '%s\n' "$output" | awk '/^root\/\/:hello_world / { print $2 }' | tail -n1)"
-  [ -n "$output_path" ]
-  grep -F "$marker" "$work1/$output_path"
-
-  run buck_build "$work2" "buck-${marker}-eu"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Cache hits: 100%"* ]]
-  [[ "$output" == *"cached: 1"* ]]
-  output_path="$(printf '%s\n' "$output" | awk '/^root\/\/:hello_world / { print $2 }' | tail -n1)"
-  [ -n "$output_path" ]
-  grep -F "$marker" "$work2/$output_path"
+kill_bazel_servers() {
+  pkill -f 'bazel\(bazel-' >/dev/null 2>&1 || true
 }
 
-@test "Nx self-hosted cache entries replicate across regions" {
-  local marker="nx-$(new_marker)"
-  local work1
-  local work2
-  work1="$(mktemp -d "${BATS_FILE_TMPDIR}/nx-1.XXXXXX")"
+generate_peer_tls_material() {
+  mkdir -p "${KURA_MTLS_CERT_DIR}"
 
-  create_nx_workspace "$work1" "$marker"
-  work2="$(mktemp -d "${BATS_FILE_TMPDIR}/nx-2.XXXXXX")"
-  cp -R "$work1/." "$work2/"
-  rm -rf "$work2/.nx" "$work2/dist"
+  cat >"${KURA_MTLS_CERT_DIR}/openssl.cnf" <<'EOF'
+[req]
+distinguished_name = req_distinguished_name
+prompt = no
 
-  run nx_build "$work1" "${KURA_US_URL}"
-  [ "$status" -eq 0 ]
-  [[ "$output" != *"[remote cache]"* ]]
-  grep -F "$marker" "$work1/dist/apps/demo/out.txt"
+[req_distinguished_name]
+CN = kura-peer
 
-  run nx_build "$work2" "${KURA_EU_URL}"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"[remote cache]"* ]]
-  grep -F "$marker" "$work2/dist/apps/demo/out.txt"
-}
+[peer_cert]
+basicConstraints = CA:false
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectAltName = @alt_names
 
-@test "Metro cache artifacts sync across regions" {
-  local work
-  local key_hex
-  local payload
-  work="$(mktemp -d "${BATS_FILE_TMPDIR}/metro.XXXXXX")"
-  key_hex="$(new_marker)$(new_marker)"
-  payload="metro-$(new_marker)"
+[alt_names]
+DNS.1 = kura-us.kura.internal
+DNS.2 = kura-eu.kura.internal
+DNS.3 = kura-ap.kura.internal
+DNS.4 = kura-ring.kura.internal
+EOF
 
-  create_metro_workspace "$work"
+  openssl genrsa -out "${KURA_MTLS_CERT_DIR}/ca.key" 2048 >/dev/null 2>&1
+  openssl req -x509 -new -nodes \
+    -key "${KURA_MTLS_CERT_DIR}/ca.key" \
+    -sha256 \
+    -days 3650 \
+    -out "${KURA_MTLS_CERT_DIR}/ca.pem" \
+    -subj "/CN=kura-peer-ca" >/dev/null 2>&1
 
-  run metro_put "$work" "${KURA_US_URL}/api/metro/cache" "$key_hex" "$payload"
-  [ "$status" -eq 0 ]
-
-  for _ in $(seq 1 20); do
-    run metro_get "$work" "${KURA_EU_URL}/api/metro/cache" "$key_hex"
-    if [ "$status" -eq 0 ]; then
-      break
-    fi
-    sleep 1
-  done
-
-  [ "$status" -eq 0 ]
-  [ "$output" = "$payload" ]
+  openssl genrsa -out "${KURA_MTLS_CERT_DIR}/peer.key" 2048 >/dev/null 2>&1
+  openssl req -new \
+    -key "${KURA_MTLS_CERT_DIR}/peer.key" \
+    -out "${KURA_MTLS_CERT_DIR}/peer.csr" \
+    -config "${KURA_MTLS_CERT_DIR}/openssl.cnf" >/dev/null 2>&1
+  openssl x509 -req \
+    -in "${KURA_MTLS_CERT_DIR}/peer.csr" \
+    -CA "${KURA_MTLS_CERT_DIR}/ca.pem" \
+    -CAkey "${KURA_MTLS_CERT_DIR}/ca.key" \
+    -CAcreateserial \
+    -out "${KURA_MTLS_CERT_DIR}/peer.pem" \
+    -days 3650 \
+    -sha256 \
+    -extfile "${KURA_MTLS_CERT_DIR}/openssl.cnf" \
+    -extensions peer_cert >/dev/null 2>&1
 }
