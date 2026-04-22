@@ -88,20 +88,18 @@ Prometheus also exposes the live RocksDB memory gauges:
 - `kura_rocksdb_write_buffer_usage_bytes`
 - `kura_rocksdb_write_buffer_capacity_bytes`
 
-## 📚 Guide
+## 🗺️ Project Areas
 
-Use this section when you want a practical path through Kura instead of a flat config dump.
+Kura is easier to read by subsystem than by tutorial step. The sections below group the project by the main areas you operate or extend.
 
-- 🚀 Want to try Kura locally? Start with [Run cache APIs locally](#guide-local).
-- 🖥️ Want to self-host one node or a small mesh? Jump to [Run Kura directly](#guide-self-host).
-- 🔐 Want secure node-to-node traffic? See [Enable peer mTLS](#guide-mtls).
-- 📣 Want legacy analytics compatibility? See [Enable analytics webhooks](#guide-analytics).
-- ☸️ Want Kubernetes? See [Deploy with Helm](#guide-helm).
-- 🧩 Want pluggable authn/authz? See [Add an extension script](#guide-extensions).
-- 📖 Need knobs and endpoints? Use [Reference](#reference).
+- 🔌 [Protocol surfaces](#-protocol-surfaces)
+- 🗄️ [Storage and replication](#-storage-and-replication)
+- ⚙️ [Runtime model and limits](#-runtime-model-and-limits)
+- 📊 [Observability and analytics](#-observability-and-analytics)
+- ☸️ [Deployment options](#-deployment-options)
+- 🧩 [Extensions and policy](#-extensions-and-policy)
 
-<a id="guide-local"></a>
-### 1. 🚀 Run cache APIs locally
+## 🔌 Protocol Surfaces
 
 Kura exposes multiple cache protocols behind one service:
 
@@ -116,6 +114,12 @@ Kura exposes multiple cache protocols behind one service:
 - 🧱 `Nx`: `PUT/GET /v1/cache/{hash}`
 - 📱 `Metro`: `PUT/GET /api/metro/cache/{cache_key}`
 - 🛠️ `Bazel` and `Buck2`: REAPI over gRPC on `KURA_GRPC_PORT`
+
+The local compose stack is still the quickest way to exercise all of those surfaces together:
+
+```bash
+docker compose up --build -d
+```
 
 Example Xcode artifact round trip:
 
@@ -143,22 +147,69 @@ curl \
 
 References:
 
-- `docker compose up --build -d`
+- `src/http.rs`
+- `src/reapi/mod.rs`
 - `test/e2e/kura_cluster.bats`
 - `test/e2e/kura_clients.bats`
 
-<a id="guide-self-host"></a>
-### 2. 🖥️ Run Kura directly
+## 🗄️ Storage And Replication
 
-At minimum, a node needs:
+Kura splits storage into two planes:
 
-- 💾 writable directories for `KURA_TMP_DIR` and `KURA_DATA_DIR`
-- 🌐 a stable `KURA_NODE_URL`
-- 🧭 seed peers in `KURA_PEERS`
-- 🏷️ a unique `KURA_REGION`
-- 🧑‍🤝‍🧑 a shared `KURA_TENANT_ID`
+- 🪨 RocksDB stores metadata, keyvalue payloads, multipart state, tombstones, segment lifecycle state, and the replication outbox.
+- 📦 Segment files store large immutable binary artifacts for the hot path.
 
-A minimal single-node example:
+Replication is leaderless and eventually consistent:
+
+- 🔁 local writes become durable together with their outbox work
+- 🌍 peers bootstrap by pulling manifests, tombstones, and artifact bodies
+- 🔎 DNS discovery can expand the peer set automatically
+- 🧠 the outbox is processed incrementally so queue depth does not blow up heap usage during backlog
+
+Peer-to-peer mTLS is available for the internal plane:
+
+- `KURA_INTERNAL_PORT`
+- `KURA_INTERNAL_TLS_CA_CERT_PATH`
+- `KURA_INTERNAL_TLS_CERT_PATH`
+- `KURA_INTERNAL_TLS_KEY_PATH`
+
+When peer mTLS is enabled:
+
+- 🔒 `KURA_NODE_URL` and every value in `KURA_PEERS` must use `https://...:<KURA_INTERNAL_PORT>`
+- 🌍 the public API still stays on `KURA_PORT`
+- 🧱 `/_internal/*` is only served on the internal mTLS listener
+- 🪪 the certificate configured through `KURA_INTERNAL_TLS_CERT_PATH` should be valid for both server and client auth
+- 🏷️ the certificate SANs must cover the hostname used in `KURA_NODE_URL`
+
+References:
+
+- `src/store.rs`
+- `src/replication/`
+- `src/peer_tls.rs`
+- `test/e2e/kura_discovery.bats`
+- `test/e2e/kura_mtls.bats`
+
+## ⚙️ Runtime Model And Limits
+
+Kura is designed around explicit resource budgets instead of relying on ambient process limits.
+
+Important runtime configuration:
+
+- 💾 `KURA_FILE_DESCRIPTOR_POOL_SIZE` controls how many application-managed file operations can hold a descriptor at once
+- ⏳ `KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS` controls how long requests wait before backpressure fails the checkout
+- 🧷 `KURA_SEGMENT_HANDLE_CACHE_SIZE` caps how many long-lived segment read handles can stay pinned in the process, and it must stay below the FD pool size so transient operations keep headroom
+- 🧠 `KURA_MEMORY_SOFT_LIMIT_BYTES` marks the point where Kura starts shedding optional memory use
+- 🚫 `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
+- 🗂️ `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
+- 📏 `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
+- 🪨 `KURA_ROCKSDB_MAX_OPEN_FILES` controls RocksDB's own SST/WAL descriptor budget
+- 🛠️ `KURA_ROCKSDB_MAX_BACKGROUND_JOBS` controls RocksDB flush and compaction concurrency
+- 📚 `KURA_ROCKSDB_BLOCK_CACHE_BYTES` caps RocksDB's block cache so index and SST warming do not grow RSS without bound
+- 🧮 `KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES` caps total RocksDB memtable memory across column families
+- 🧱 `KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES` controls the size of each memtable before flush
+- 🔢 `KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER` controls how many memtables each column family may keep in memory
+
+A minimal direct-binary deployment still looks like:
 
 ```bash
 KURA_PORT=4000 \
@@ -188,46 +239,38 @@ KURA_OTEL_DEPLOYMENT_ENVIRONMENT=production \
 ./target/release/kura
 ```
 
-For multi-node deployments:
-
-- 🔁 keep `KURA_PEERS` populated with at least a seed set of nodes
-- 🔎 optionally set `KURA_DISCOVERY_DNS_NAME` to a DNS name that resolves to all healthy nodes
-- 🌍 ensure every node can reach every other node's public and internal listener
-- ⏱️ keep clocks reasonably in sync because replication and tombstones use version timestamps
-
 References:
 
 - `src/config.rs`
-- `src/replication/`
-- `test/e2e/kura_discovery.bats`
+- `src/memory/`
+- `src/io/`
 
-<a id="guide-mtls"></a>
-### 3. 🔐 Enable peer mTLS between nodes
+## 📊 Observability And Analytics
 
-For peer-to-peer mTLS, additionally set:
+Kura ships with a fairly complete local observability story:
 
-- `KURA_INTERNAL_PORT`
-- `KURA_INTERNAL_TLS_CA_CERT_PATH`
-- `KURA_INTERNAL_TLS_CERT_PATH`
-- `KURA_INTERNAL_TLS_KEY_PATH`
+- 📈 Prometheus metrics
+- 📉 Grafana dashboards
+- 🪵 Loki and Promtail logs
+- 🧭 Tempo traces
 
-When peer mTLS is enabled:
+Prometheus exposes the live RocksDB memory gauges:
 
-- 🔒 `KURA_NODE_URL` and every value in `KURA_PEERS` must use `https://...:<KURA_INTERNAL_PORT>`
-- 🌍 the public API still stays on `KURA_PORT`
-- 🧱 `/_internal/*` is only served on the internal mTLS listener
-- 🪪 the certificate configured through `KURA_INTERNAL_TLS_CERT_PATH` should be valid for both server and client auth
-- 🏷️ the certificate SANs must cover the hostname used in `KURA_NODE_URL`
+- `kura_rocksdb_block_cache_usage_bytes`
+- `kura_rocksdb_block_cache_pinned_usage_bytes`
+- `kura_rocksdb_block_cache_capacity_bytes`
+- `kura_rocksdb_write_buffer_usage_bytes`
+- `kura_rocksdb_write_buffer_capacity_bytes`
 
-References:
+Kura also exports:
 
-- `src/peer_tls.rs`
-- `test/e2e/kura_mtls.bats`
+- 📦 artifact read and write counters by `kind`, `client`, `artifact_class`, and `result`
+- 🔁 replication latency and result metrics
+- 💾 file descriptor pool pressure metrics
+- 🧠 manifest cache occupancy and admission metrics
+- 📣 analytics queue, batch, and circuit-breaker metrics
 
-<a id="guide-analytics"></a>
-### 4. 📣 Enable analytics webhooks
-
-Kura can emit the same best-effort batched analytics webhooks as the older Tuist cache for Xcode and Gradle cache traffic.
+Analytics webhooks are a separate optional subsystem that mirrors the older Tuist cache contract for Xcode and Gradle traffic.
 
 When enabled:
 
@@ -251,11 +294,13 @@ Configure it with:
 
 References:
 
+- `src/metrics.rs`
 - `src/analytics.rs`
-- `test/e2e/kura_cluster.bats`
+- `ops/grafana/`
 
-<a id="guide-helm"></a>
-### 5. ☸️ Deploy with Helm on Kubernetes
+## ☸️ Deployment Options
+
+### Helm And Kubernetes
 
 The repository includes a Helm chart at `ops/helm/kura` that deploys Kura as a `StatefulSet` with:
 
@@ -291,8 +336,6 @@ For a local kind smoke test, the repo includes:
 ./test/e2e/kura_helm_kind.sh
 ```
 
-That script builds a local image, creates a kind cluster, installs the Helm chart, and verifies that an artifact written through one pod can be read from another pod.
-
 To enable peer mTLS in Kubernetes, set:
 
 - `peerTls.enabled=true`
@@ -307,14 +350,33 @@ The referenced secret should contain the files configured by:
 
 When enabled, the chart advertises peer URLs over `https` on the internal port and mounts the secret into `/etc/kura/peer-tls`.
 
+### Scaleway Kapsule
+
+For Scaleway, start from the bundled overrides in `ops/helm/kura/values-scaleway.yaml`:
+
+```bash
+helm upgrade --install kura ./ops/helm/kura \
+  --namespace kura \
+  --create-namespace \
+  -f ./ops/helm/kura/values-scaleway.yaml \
+  --set image.repository=ghcr.io/tuist/kura \
+  --set image.tag=latest \
+  --set config.region=fr-par \
+  --set config.telemetry.otlpTracesEndpoint=http://otel-collector.monitoring.svc.cluster.local:4318/v1/traces
+```
+
+That values file does two important things:
+
+- 🚪 uses a `LoadBalancer` service, which is the simplest way to expose Kura on Kapsule
+- 💾 pins persistence to `scw-bssd`, which Scaleway documents as the default block storage class for Kapsule multi-AZ clusters
+
 References:
 
 - `ops/helm/kura`
 - `ops/helm/kura/values-scaleway.yaml`
 - `test/e2e/kura_helm_kind.sh`
 
-<a id="guide-extensions"></a>
-### 6. 🧩 Add an extension script
+## 🧩 Extensions And Policy
 
 Kura can load one operator-provided extension script at startup to customize authentication, authorization, and response headers without recompiling the binary.
 
