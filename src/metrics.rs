@@ -33,6 +33,7 @@ pub struct Metrics {
     segment_evicted_artifacts: Family<ArtifactOpLabels, Counter>,
     replication_requests: Family<ReplicationLabels, Counter>,
     replication_request_duration: Family<ReplicationRouteLabels, Histogram>,
+    replication_apply_results: Family<ReplicationApplyLabels, Counter>,
     multipart_parts: Family<MultipartLabels, Counter>,
     node_info: Family<NodeInfoLabels, Gauge>,
     file_descriptor_wait: Family<FileDescriptorWaitLabels, Histogram>,
@@ -113,6 +114,7 @@ impl Metrics {
             Family::<ReplicationRouteLabels, Histogram>::new_with_constructor(|| {
                 Histogram::new(exponential_buckets(0.001, 2.0, 16))
             });
+        let replication_apply_results = Family::<ReplicationApplyLabels, Counter>::default();
         let multipart_parts = Family::<MultipartLabels, Counter>::default();
         let node_info = Family::<NodeInfoLabels, Gauge>::default();
         let file_descriptor_wait =
@@ -252,6 +254,11 @@ impl Metrics {
             "kura_replication_request_duration_seconds",
             "Peer replication request latency by target and operation",
             replication_request_duration.clone(),
+        );
+        registry.register(
+            "kura_replication_apply_results_total",
+            "Receiver and bootstrap apply outcomes for replicated artifacts and namespace deletes",
+            replication_apply_results.clone(),
         );
         registry.register(
             "kura_multipart_parts_total",
@@ -534,6 +541,7 @@ impl Metrics {
             segment_evicted_artifacts,
             replication_requests,
             replication_request_duration,
+            replication_apply_results,
             multipart_parts,
             node_info,
             file_descriptor_wait,
@@ -718,6 +726,16 @@ impl Metrics {
                 operation: operation.to_owned(),
             })
             .observe(duration.as_secs_f64());
+    }
+
+    pub fn record_replication_apply(&self, source: &str, item_type: &str, outcome: &str) {
+        self.replication_apply_results
+            .get_or_create(&ReplicationApplyLabels {
+                source: source.to_owned(),
+                item_type: item_type.to_owned(),
+                outcome: outcome.to_owned(),
+            })
+            .inc();
     }
 
     pub fn record_multipart_part(&self, result: &str) {
@@ -1091,6 +1109,13 @@ struct ReplicationRouteLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReplicationApplyLabels {
+    source: String,
+    item_type: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MultipartLabels {
     result: String,
 }
@@ -1243,6 +1268,8 @@ mod tests {
             "ok",
             Duration::from_millis(5),
         );
+        metrics.record_replication_apply("replication", "artifact", "applied");
+        metrics.record_replication_apply("bootstrap", "namespace_delete", "ignored_older");
         metrics.record_multipart_part("ok");
         metrics.record_file_descriptor_wait("ok", Duration::from_millis(1));
         metrics.record_file_operation("open_read", "ok", Duration::from_millis(2), 42);
@@ -1286,6 +1313,13 @@ mod tests {
         assert!(rendered.contains("kura_segment_refreshes_total"));
         assert!(rendered.contains("kura_segment_evicted_artifacts_total"));
         assert!(rendered.contains("kura_replication_requests_total"));
+        assert!(rendered.contains("kura_replication_apply_results_total"));
+        assert!(rendered.contains("source=\"replication\""));
+        assert!(rendered.contains("source=\"bootstrap\""));
+        assert!(rendered.contains("item_type=\"artifact\""));
+        assert!(rendered.contains("item_type=\"namespace_delete\""));
+        assert!(rendered.contains("outcome=\"applied\""));
+        assert!(rendered.contains("outcome=\"ignored_older\""));
         assert!(rendered.contains("kura_multipart_parts_total"));
         assert!(rendered.contains("kura_node_info"));
         assert!(rendered.contains("kura_file_descriptor_wait_seconds"));

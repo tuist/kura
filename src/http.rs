@@ -1235,15 +1235,23 @@ async fn internal_replicate_artifact(
         None => return error_response(StatusCode::BAD_REQUEST, "Invalid artifact kind"),
     };
 
-    match state.store.artifact_version_is_current(
+    match state.store.artifact_apply_outcome(
         kind,
         &query.namespace_id,
         &query.key,
         query.version_ms,
     ) {
-        Ok(false) => return StatusCode::NO_CONTENT.into_response(),
-        Ok(true) => {}
+        Ok(outcome) if !outcome.applied() => {
+            state
+                .metrics
+                .record_replication_apply("replication", "artifact", outcome.as_str());
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        Ok(_) => {}
         Err(error) => {
+            state
+                .metrics
+                .record_replication_apply("replication", "artifact", "error");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to evaluate replication version: {error}"),
@@ -1258,6 +1266,9 @@ async fn internal_replicate_artifact(
                 state
                     .metrics
                     .record_memory_action("keyvalue_payload_rejected");
+                state
+                    .metrics
+                    .record_replication_apply("replication", "artifact", "error");
                 return error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!("Failed to read replication body: {error}"),
@@ -1277,11 +1288,21 @@ async fn internal_replicate_artifact(
             )
             .await
         {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to persist replicated artifact: {error}"),
-            ),
+            Ok(outcome) => {
+                state
+                    .metrics
+                    .record_replication_apply("replication", "artifact", outcome.as_str());
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(error) => {
+                state
+                    .metrics
+                    .record_replication_apply("replication", "artifact", "error");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to persist replicated artifact: {error}"),
+                )
+            }
         };
     }
 
@@ -1295,12 +1316,18 @@ async fn internal_replicate_artifact(
     {
         Ok(temp) => temp,
         Err(BodyReadError::TooLarge) => {
+            state
+                .metrics
+                .record_replication_apply("replication", "artifact", "error");
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Request body exceeded allowed size",
             );
         }
         Err(BodyReadError::Io(error)) => {
+            state
+                .metrics
+                .record_replication_apply("replication", "artifact", "error");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to read replication body: {error}"),
@@ -1320,11 +1347,21 @@ async fn internal_replicate_artifact(
         )
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to persist replicated artifact: {error}"),
-        ),
+        Ok(outcome) => {
+            state
+                .metrics
+                .record_replication_apply("replication", "artifact", outcome.as_str());
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            state
+                .metrics
+                .record_replication_apply("replication", "artifact", "error");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist replicated artifact: {error}"),
+            )
+        }
     }
 }
 
@@ -1347,11 +1384,23 @@ async fn internal_delete_namespace(
         .apply_replicated_namespace_delete(&namespace_id, version_ms)
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete replicated namespace: {error}"),
-        ),
+        Ok(outcome) => {
+            state.metrics.record_replication_apply(
+                "replication",
+                "namespace_delete",
+                outcome.as_str(),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            state
+                .metrics
+                .record_replication_apply("replication", "namespace_delete", "error");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete replicated namespace: {error}"),
+            )
+        }
     }
 }
 

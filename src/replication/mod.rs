@@ -19,8 +19,9 @@ use crate::{
     artifact::manifest::ArtifactManifest,
     config::Config,
     constants::REPLICATION_RETRY_SECS,
+    failpoints::FailpointName,
     state::SharedState,
-    store::{ManifestPage, NamespaceTombstonePage},
+    store::{ArtifactApplyOutcome, ManifestPage, NamespaceTombstonePage},
     telemetry::inject_current_trace_context,
     utils::{replication_target_label, temp_file_path, url_encode},
 };
@@ -198,11 +199,23 @@ async fn bootstrap_namespace_tombstones_from_peer(
     loop {
         let page = fetch_bootstrap_tombstones_page(state, peer, after.as_deref()).await?;
         for tombstone in &page.tombstones {
-            if state
+            let outcome = state
                 .store
                 .apply_replicated_namespace_delete(&tombstone.namespace_id, tombstone.version_ms)
-                .await?
-            {
+                .await
+                .inspect_err(|_| {
+                    state.metrics.record_replication_apply(
+                        "bootstrap",
+                        "namespace_delete",
+                        "error",
+                    );
+                })?;
+            state.metrics.record_replication_apply(
+                "bootstrap",
+                "namespace_delete",
+                outcome.as_str(),
+            );
+            if outcome.applied() {
                 applied += 1;
             }
         }
@@ -220,17 +233,35 @@ async fn bootstrap_manifests_from_peer(state: &SharedState, peer: &str) -> Resul
 
     loop {
         let page = fetch_bootstrap_manifests_page(state, peer, after.as_deref()).await?;
+        state
+            .store
+            .hit_failpoint(FailpointName::AfterBootstrapManifestPageFetchBeforeApply)
+            .await?;
         for manifest in &page.manifests {
-            if !state.store.artifact_version_is_current(
+            let outcome = state.store.artifact_apply_outcome(
                 manifest.kind,
                 &manifest.namespace_id,
                 &manifest.key,
                 manifest.version_ms,
-            )? {
+            )?;
+            if !outcome.applied() {
+                state
+                    .metrics
+                    .record_replication_apply("bootstrap", "artifact", outcome.as_str());
                 continue;
             }
 
-            if bootstrap_artifact_from_peer(state, peer, manifest).await? {
+            let outcome = bootstrap_artifact_from_peer(state, peer, manifest)
+                .await
+                .inspect_err(|_| {
+                    state
+                        .metrics
+                        .record_replication_apply("bootstrap", "artifact", "error");
+                })?;
+            state
+                .metrics
+                .record_replication_apply("bootstrap", "artifact", outcome.as_str());
+            if outcome.applied() {
                 applied += 1;
             }
         }
@@ -246,7 +277,7 @@ async fn bootstrap_artifact_from_peer(
     state: &SharedState,
     peer: &str,
     manifest: &ArtifactManifest,
-) -> Result<bool, String> {
+) -> Result<ArtifactApplyOutcome, String> {
     let url = format!(
         "{peer}/_internal/bootstrap/artifacts/{}",
         url_encode(&manifest.artifact_id)
@@ -258,7 +289,7 @@ async fn bootstrap_artifact_from_peer(
         .await
         .map_err(|error| format!("bootstrap artifact request failed: {error}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
+        return Ok(ArtifactApplyOutcome::IgnoredStale);
     }
     let response = response
         .error_for_status()
@@ -269,6 +300,10 @@ async fn bootstrap_artifact_from_peer(
             .bytes()
             .await
             .map_err(|error| format!("failed to read bootstrap keyvalue body: {error}"))?;
+        state
+            .store
+            .hit_failpoint(FailpointName::AfterBootstrapArtifactFetchBeforePersist)
+            .await?;
         return state
             .store
             .apply_replicated_artifact_from_bytes(
@@ -284,6 +319,10 @@ async fn bootstrap_artifact_from_peer(
 
     let temp_path = temp_file_path(&state.config.tmp_dir.join("bootstrap"), "bootstrap");
     stream_response_to_temp(state, response, &temp_path).await?;
+    state
+        .store
+        .hit_failpoint(FailpointName::AfterBootstrapArtifactFetchBeforePersist)
+        .await?;
     state
         .store
         .apply_replicated_artifact_from_path(
@@ -425,13 +464,30 @@ pub async fn process_outbox(state: &SharedState) -> Result<(), String> {
 
         match result {
             Ok(()) => {
-                state.metrics.record_replication(
-                    &message.target,
-                    operation_name,
-                    "ok",
-                    started_at.elapsed(),
-                );
-                state.store.delete_outbox_message(&message_key)?;
+                match state
+                    .store
+                    .hit_failpoint(FailpointName::BeforeDeleteOutboxMessageAfterSuccess)
+                    .await
+                {
+                    Ok(()) => {
+                        state.metrics.record_replication(
+                            &message.target,
+                            operation_name,
+                            "ok",
+                            started_at.elapsed(),
+                        );
+                        state.store.delete_outbox_message(&message_key)?;
+                    }
+                    Err(error) => {
+                        state.metrics.record_replication(
+                            &message.target,
+                            operation_name,
+                            "error",
+                            started_at.elapsed(),
+                        );
+                        warn!("replication to {} failed: {error}", message.target);
+                    }
+                }
             }
             Err(error) => {
                 state.metrics.record_replication(
@@ -573,11 +629,17 @@ async fn replicate_message(state: &SharedState, message: &OutboxMessage) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use axum::Router;
+    use axum::{Json, Router, extract::Path as AxumPath, http::StatusCode, routing::get};
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::{artifact::kind::ArtifactKind, http::router, test_support::test_context};
+    use crate::{
+        artifact::kind::ArtifactKind,
+        failpoints::{FailpointAction, FailpointName},
+        http::router,
+        test_support::test_context,
+        utils::artifact_storage_id,
+    };
 
     async fn spawn_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -592,6 +654,31 @@ mod tests {
                 .expect("test server should run");
         });
         (format!("http://{address}"), handle)
+    }
+
+    fn bootstrap_test_manifest(
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        size: u64,
+        version_ms: u64,
+    ) -> ArtifactManifest {
+        ArtifactManifest {
+            artifact_id: artifact_storage_id(kind, "test-tenant", namespace_id, key),
+            kind,
+            client: kind.client(),
+            artifact_class: kind.artifact_class(),
+            namespace_id: namespace_id.to_owned(),
+            key: key.to_owned(),
+            content_type: content_type.to_owned(),
+            blob_path: None,
+            segment_id: None,
+            segment_offset: None,
+            size,
+            version_ms,
+            created_at_ms: version_ms,
+        }
     }
 
     #[tokio::test]
@@ -740,6 +827,326 @@ mod tests {
         assert!(
             queued.is_empty(),
             "successful replication should clear outbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_outbox_retries_after_success_before_outbox_delete() {
+        let remote = test_context(|_| {}).await;
+        let (remote_url, _server) = spawn_server(router(remote.state.clone())).await;
+        let local = test_context(|_| {}).await;
+
+        let manifest = local
+            .state
+            .store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Gradle,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"payload",
+            )
+            .await
+            .expect("artifact should persist");
+
+        local
+            .state
+            .store
+            .enqueue(OutboxMessage {
+                target: remote_url,
+                operation: ReplicationOperation::UpsertArtifact {
+                    kind: ArtifactKind::Gradle,
+                    namespace_id: "ios".into(),
+                    key: "artifact".into(),
+                    content_type: "application/octet-stream".into(),
+                    artifact_id: manifest.artifact_id.clone(),
+                    version_ms: manifest.version_ms,
+                },
+            })
+            .expect("outbox message should enqueue");
+
+        local.state.store.failpoints().set_once(
+            FailpointName::BeforeDeleteOutboxMessageAfterSuccess,
+            FailpointAction::Error("delete interrupted".into()),
+        );
+
+        process_outbox(&local.state)
+            .await
+            .expect("outbox processing should complete");
+
+        assert_eq!(
+            local
+                .state
+                .store
+                .outbox_message_count()
+                .expect("outbox count should load"),
+            1
+        );
+
+        process_outbox(&local.state)
+            .await
+            .expect("outbox retry should complete");
+
+        assert_eq!(
+            local
+                .state
+                .store
+                .outbox_message_count()
+                .expect("outbox count should load"),
+            0
+        );
+        let replicated = remote
+            .state
+            .store
+            .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact")
+            .await
+            .expect("artifact fetch should succeed")
+            .expect("replicated artifact should exist");
+        let mut reader = remote
+            .state
+            .store
+            .open_artifact_reader(&replicated)
+            .await
+            .expect("artifact reader should open");
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect("artifact bytes should read");
+        assert_eq!(bytes, b"payload");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_respects_local_newer_winner() {
+        let remote = test_context(|_| {}).await;
+        let remote_manifest = remote
+            .state
+            .store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"remote-v1",
+            )
+            .await
+            .expect("remote artifact should persist");
+        let (remote_url, _server) = spawn_server(router(remote.state.clone())).await;
+
+        let local = test_context(|_| {}).await;
+        local
+            .state
+            .store
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"local-v2",
+                remote_manifest.version_ms + 100,
+            )
+            .await
+            .expect("local newer artifact should apply");
+
+        let outcome = bootstrap_artifact_from_peer(&local.state, &remote_url, &remote_manifest)
+            .await
+            .expect("bootstrap should complete");
+        assert_eq!(outcome, ArtifactApplyOutcome::IgnoredStale);
+
+        let manifest = local
+            .state
+            .store
+            .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact")
+            .await
+            .expect("artifact fetch should succeed")
+            .expect("artifact should remain");
+        let mut reader = local
+            .state
+            .store
+            .open_artifact_reader(&manifest)
+            .await
+            .expect("artifact reader should open");
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect("artifact bytes should read");
+        assert_eq!(bytes, b"local-v2");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_tombstones_prevent_stale_manifest_resurrection() {
+        let stale_manifest = bootstrap_test_manifest(
+            ArtifactKind::Keyvalue,
+            "ios",
+            "cas-1",
+            "application/json",
+            br#"{"value":"stale"}"#.len() as u64,
+            100,
+        );
+        let tombstones = NamespaceTombstonePage {
+            tombstones: vec![crate::store::NamespaceTombstoneRecord {
+                namespace_id: "ios".into(),
+                version_ms: 200,
+            }],
+            next_after: None,
+        };
+        let manifests = ManifestPage {
+            manifests: vec![stale_manifest.clone()],
+            next_after: None,
+        };
+        let artifact_payload = br#"{"value":"stale"}"#.to_vec();
+        let app = Router::new()
+            .route(
+                "/_internal/bootstrap/namespace_tombstones",
+                get({
+                    let tombstones = tombstones.clone();
+                    move || {
+                        let tombstones = tombstones.clone();
+                        async move { Json(tombstones) }
+                    }
+                }),
+            )
+            .route(
+                "/_internal/bootstrap/manifests",
+                get({
+                    let manifests = manifests.clone();
+                    move || {
+                        let manifests = manifests.clone();
+                        async move { Json(manifests) }
+                    }
+                }),
+            )
+            .route(
+                "/_internal/bootstrap/artifacts/{artifact_id}",
+                get(move |AxumPath(_artifact_id): AxumPath<String>| {
+                    let artifact_payload = artifact_payload.clone();
+                    async move { (StatusCode::OK, artifact_payload) }
+                }),
+            );
+        let (remote_url, _server) = spawn_server(app).await;
+        let local = test_context(|_| {}).await;
+
+        let stats = bootstrap_from_peer(&local.state, &remote_url)
+            .await
+            .expect("bootstrap should complete");
+        assert_eq!(stats.tombstones_applied, 1);
+        assert_eq!(stats.artifacts_applied, 0);
+        assert!(
+            local
+                .state
+                .store
+                .fetch_artifact(ArtifactKind::Keyvalue, "ios", "cas-1")
+                .await
+                .expect("artifact fetch should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_stale_manifest_then_tombstone_converges_to_delete() {
+        let stale_manifest = bootstrap_test_manifest(
+            ArtifactKind::Keyvalue,
+            "ios",
+            "cas-1",
+            "application/json",
+            br#"{"value":"stale"}"#.len() as u64,
+            100,
+        );
+        let tombstones = NamespaceTombstonePage {
+            tombstones: vec![crate::store::NamespaceTombstoneRecord {
+                namespace_id: "ios".into(),
+                version_ms: 200,
+            }],
+            next_after: None,
+        };
+        let artifact_payload = br#"{"value":"stale"}"#.to_vec();
+        let app = Router::new()
+            .route(
+                "/_internal/bootstrap/namespace_tombstones",
+                get({
+                    let tombstones = tombstones.clone();
+                    move || {
+                        let tombstones = tombstones.clone();
+                        async move { Json(tombstones) }
+                    }
+                }),
+            )
+            .route(
+                "/_internal/bootstrap/artifacts/{artifact_id}",
+                get(move |AxumPath(_artifact_id): AxumPath<String>| {
+                    let artifact_payload = artifact_payload.clone();
+                    async move { (StatusCode::OK, artifact_payload) }
+                }),
+            );
+        let (remote_url, _server) = spawn_server(app).await;
+        let local = test_context(|_| {}).await;
+
+        let outcome = bootstrap_artifact_from_peer(&local.state, &remote_url, &stale_manifest)
+            .await
+            .expect("artifact bootstrap should complete");
+        assert_eq!(outcome, ArtifactApplyOutcome::Applied);
+        assert!(
+            local
+                .state
+                .store
+                .fetch_artifact(ArtifactKind::Keyvalue, "ios", "cas-1")
+                .await
+                .expect("artifact fetch should succeed")
+                .is_some()
+        );
+
+        let applied = bootstrap_namespace_tombstones_from_peer(&local.state, &remote_url)
+            .await
+            .expect("tombstone bootstrap should complete");
+        assert_eq!(applied, 1);
+        assert!(
+            local
+                .state
+                .store
+                .fetch_artifact(ArtifactKind::Keyvalue, "ios", "cas-1")
+                .await
+                .expect("artifact fetch should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_fetch_failpoint_prevents_partial_visibility() {
+        let remote = test_context(|_| {}).await;
+        let remote_manifest = remote
+            .state
+            .store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Gradle,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"payload",
+            )
+            .await
+            .expect("remote artifact should persist");
+        let (remote_url, _server) = spawn_server(router(remote.state.clone())).await;
+        let local = test_context(|_| {}).await;
+        local.state.store.failpoints().set_once(
+            FailpointName::AfterBootstrapArtifactFetchBeforePersist,
+            FailpointAction::Error("bootstrap interrupted".into()),
+        );
+
+        let error = bootstrap_artifact_from_peer(&local.state, &remote_url, &remote_manifest)
+            .await
+            .expect_err("bootstrap should fail before persist");
+        assert!(error.contains("bootstrap interrupted"));
+        assert!(
+            local
+                .state
+                .store
+                .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact")
+                .await
+                .expect("artifact fetch should succeed")
+                .is_none()
         );
     }
 }

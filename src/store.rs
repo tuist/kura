@@ -33,6 +33,7 @@ use crate::{
         ROCKSDB_CF_NAMESPACE_TOMBSTONES, ROCKSDB_CF_OUTBOX, ROCKSDB_CF_SEGMENT_ARTIFACTS,
         ROCKSDB_CF_SEGMENT_STATE, ROCKSDB_WAL_BYTES_PER_SYNC,
     },
+    failpoints::{FailpointName, FailpointSet},
     io::{IoController, PersistentFile},
     memory::MemoryController,
     multipart::{error::MultipartError, part::MultipartPart, upload::MultipartUpload},
@@ -61,6 +62,7 @@ pub struct Store {
     segment_refresh_lock: Mutex<()>,
     segment_handles: Mutex<SegmentHandleCache>,
     manifest_cache: StdMutex<ManifestCache>,
+    failpoints: Arc<FailpointSet>,
 }
 
 pub struct StoreSnapshot {
@@ -100,6 +102,63 @@ struct PersistArtifactSpec<'a> {
     content_type: &'a str,
     version_ms: u64,
     replication_targets: &'a [String],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactApplyOutcome {
+    Applied,
+    IgnoredStale,
+    IgnoredTombstone,
+}
+
+impl ArtifactApplyOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::IgnoredStale => "ignored_stale",
+            Self::IgnoredTombstone => "ignored_tombstone",
+        }
+    }
+
+    pub(crate) fn applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamespaceDeleteOutcome {
+    Applied,
+    IgnoredOlder,
+}
+
+impl NamespaceDeleteOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::IgnoredOlder => "ignored_older",
+        }
+    }
+
+    pub(crate) fn applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PersistArtifactOutcome {
+    Applied(ArtifactManifest),
+    IgnoredStale(ArtifactManifest),
+    IgnoredTombstone,
+}
+
+impl PersistArtifactOutcome {
+    fn apply_outcome(&self) -> ArtifactApplyOutcome {
+        match self {
+            Self::Applied(_) => ArtifactApplyOutcome::Applied,
+            Self::IgnoredStale(_) => ArtifactApplyOutcome::IgnoredStale,
+            Self::IgnoredTombstone => ArtifactApplyOutcome::IgnoredTombstone,
+        }
+    }
 }
 
 impl Store {
@@ -226,6 +285,7 @@ impl Store {
             segment_refresh_lock: Mutex::new(()),
             segment_handles: Mutex::new(SegmentHandleCache::new(config.segment_handle_cache_size)),
             manifest_cache: StdMutex::new(ManifestCache::new(config.manifest_cache_max_bytes)),
+            failpoints: Arc::new(FailpointSet::default()),
         })
     }
 
@@ -289,13 +349,16 @@ impl Store {
             version_ms: now_ms(),
             replication_targets,
         };
-        self.persist_artifact_from_path_with_version(spec, source_path)
-        .await?
-        .ok_or_else(|| {
-            format!(
+        match self
+            .persist_artifact_from_path_with_version(spec, source_path)
+            .await?
+        {
+            PersistArtifactOutcome::Applied(manifest)
+            | PersistArtifactOutcome::IgnoredStale(manifest) => Ok(manifest),
+            PersistArtifactOutcome::IgnoredTombstone => Err(format!(
                 "artifact write for {kind:?}/{namespace_id}/{key} was rejected by a newer tombstone"
-            )
-        })
+            )),
+        }
     }
 
     pub async fn apply_replicated_artifact_from_path(
@@ -306,7 +369,7 @@ impl Store {
         content_type: &str,
         source_path: &Path,
         version_ms: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<ArtifactApplyOutcome, String> {
         let spec = PersistArtifactSpec {
             kind,
             namespace_id,
@@ -318,14 +381,14 @@ impl Store {
         Ok(self
             .persist_artifact_from_path_with_version(spec, source_path)
             .await?
-            .is_some())
+            .apply_outcome())
     }
 
     async fn persist_artifact_from_path_with_version(
         &self,
         spec: PersistArtifactSpec<'_>,
         source_path: &Path,
-    ) -> Result<Option<ArtifactManifest>, String> {
+    ) -> Result<PersistArtifactOutcome, String> {
         if spec.kind == ArtifactKind::Keyvalue {
             let bytes = self.io.read(source_path).await?;
             self.io.remove_file_if_exists(source_path).await;
@@ -351,11 +414,11 @@ impl Store {
             && (manifest_version_ms(existing) >= spec.version_ms || spec.version_ms == 0)
         {
             self.io.remove_file_if_exists(source_path).await;
-            return Ok(Some(existing.clone()));
+            return Ok(PersistArtifactOutcome::IgnoredStale(existing.clone()));
         }
         if self.namespace_tombstone_blocks(spec.namespace_id, spec.version_ms)? {
             self.io.remove_file_if_exists(source_path).await;
-            return Ok(None);
+            return Ok(PersistArtifactOutcome::IgnoredTombstone);
         }
 
         let persisted_version_ms = persisted_version_ms(spec.version_ms);
@@ -397,6 +460,9 @@ impl Store {
                 Vec::new(),
             )
         };
+
+        self.hit_failpoint(FailpointName::AfterArtifactBytesDurableBeforeMetadata)
+            .await?;
 
         let manifest = ArtifactManifest {
             artifact_id: artifact_id.clone(),
@@ -446,11 +512,13 @@ impl Store {
         self.append_artifact_replication_messages(&mut batch, &manifest, spec.replication_targets)?;
 
         self.write_batch_sync(batch, "manifest batch")?;
+        self.hit_failpoint(FailpointName::AfterMetadataCommitBeforeReturn)
+            .await?;
         self.maybe_cache_manifest(manifest.clone());
 
         self.evict_segments(spec.kind, evicted_segments).await?;
 
-        Ok(Some(manifest))
+        Ok(PersistArtifactOutcome::Applied(manifest))
     }
 
     pub async fn open_artifact_reader(
@@ -637,7 +705,7 @@ impl Store {
         bytes: &[u8],
         version_ms: u64,
         replication_targets: &[String],
-    ) -> Result<Option<ArtifactManifest>, String> {
+    ) -> Result<PersistArtifactOutcome, String> {
         let artifact_id =
             artifact_storage_id(ArtifactKind::Keyvalue, &self.tenant_id, namespace_id, key);
 
@@ -648,10 +716,10 @@ impl Store {
             && existing.blob_path.is_none()
             && (manifest_version_ms(existing) >= version_ms || version_ms == 0)
         {
-            return Ok(Some(existing.clone()));
+            return Ok(PersistArtifactOutcome::IgnoredStale(existing.clone()));
         }
         if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
-            return Ok(None);
+            return Ok(PersistArtifactOutcome::IgnoredTombstone);
         }
 
         let persisted_version_ms = persisted_version_ms(version_ms);
@@ -691,7 +759,10 @@ impl Store {
         self.write_batch_sync(batch, "keyvalue batch")?;
         self.maybe_cache_manifest(manifest.clone());
 
-        Ok(Some(manifest))
+        self.hit_failpoint(FailpointName::AfterMetadataCommitBeforeReturn)
+            .await?;
+
+        Ok(PersistArtifactOutcome::Applied(manifest))
     }
 
     fn keyvalue_bytes(&self, artifact_id: &str) -> Result<Option<Vec<u8>>, String> {
@@ -990,13 +1061,16 @@ impl Store {
             version_ms: now_ms(),
             replication_targets: &[],
         };
-        self.persist_artifact_from_bytes_with_version(spec, bytes)
-        .await?
-        .ok_or_else(|| {
-            format!(
+        match self
+            .persist_artifact_from_bytes_with_version(spec, bytes)
+            .await?
+        {
+            PersistArtifactOutcome::Applied(manifest)
+            | PersistArtifactOutcome::IgnoredStale(manifest) => Ok(manifest),
+            PersistArtifactOutcome::IgnoredTombstone => Err(format!(
                 "artifact write for {kind:?}/{namespace_id}/{key} was rejected by a newer tombstone"
-            )
-        })
+            )),
+        }
     }
 
     pub async fn persist_artifact_from_bytes_and_enqueue(
@@ -1016,13 +1090,16 @@ impl Store {
             version_ms: now_ms(),
             replication_targets,
         };
-        self.persist_artifact_from_bytes_with_version(spec, bytes)
-        .await?
-        .ok_or_else(|| {
-            format!(
+        match self
+            .persist_artifact_from_bytes_with_version(spec, bytes)
+            .await?
+        {
+            PersistArtifactOutcome::Applied(manifest)
+            | PersistArtifactOutcome::IgnoredStale(manifest) => Ok(manifest),
+            PersistArtifactOutcome::IgnoredTombstone => Err(format!(
                 "artifact write for {kind:?}/{namespace_id}/{key} was rejected by a newer tombstone"
-            )
-        })
+            )),
+        }
     }
 
     pub async fn apply_replicated_artifact_from_bytes(
@@ -1033,7 +1110,7 @@ impl Store {
         content_type: &str,
         bytes: &[u8],
         version_ms: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<ArtifactApplyOutcome, String> {
         let spec = PersistArtifactSpec {
             kind,
             namespace_id,
@@ -1045,14 +1122,14 @@ impl Store {
         Ok(self
             .persist_artifact_from_bytes_with_version(spec, bytes)
             .await?
-            .is_some())
+            .apply_outcome())
     }
 
     async fn persist_artifact_from_bytes_with_version(
         &self,
         spec: PersistArtifactSpec<'_>,
         bytes: &[u8],
-    ) -> Result<Option<ArtifactManifest>, String> {
+    ) -> Result<PersistArtifactOutcome, String> {
         if spec.kind == ArtifactKind::Keyvalue {
             return self
                 .persist_keyvalue_artifact_with_version(
@@ -1095,7 +1172,7 @@ impl Store {
         &self,
         namespace_id: &str,
         version_ms: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<NamespaceDeleteOutcome, String> {
         self.delete_namespace_with_version(namespace_id, version_ms, &[])
             .await
     }
@@ -1105,18 +1182,20 @@ impl Store {
         namespace_id: &str,
         version_ms: u64,
         replication_targets: &[String],
-    ) -> Result<bool, String> {
+    ) -> Result<NamespaceDeleteOutcome, String> {
         let prefix = format!("{namespace_id}\0");
         let mut batch = WriteBatch::default();
         let mut blob_paths = Vec::new();
         let mut removed_artifact_ids = Vec::new();
         let delete_everything = version_ms == 0;
 
+        self.hit_failpoint(FailpointName::BeforeApplyReplicatedTombstone)
+            .await?;
         if !delete_everything
             && let Some(current_tombstone) = self.namespace_tombstone_version(namespace_id)?
             && current_tombstone >= version_ms
         {
-            return Ok(false);
+            return Ok(NamespaceDeleteOutcome::IgnoredOlder);
         }
         if !delete_everything {
             batch.put_cf(
@@ -1182,7 +1261,10 @@ impl Store {
             self.io.remove_file_if_exists(&path).await;
         }
 
-        Ok(true)
+        self.hit_failpoint(FailpointName::AfterApplyReplicatedTombstone)
+            .await?;
+
+        Ok(NamespaceDeleteOutcome::Applied)
     }
 
     pub fn start_multipart_upload(
@@ -1538,6 +1620,7 @@ impl Store {
             .map_err(|error| format!("failed to delete outbox entry: {error}"))
     }
 
+    #[cfg(test)]
     pub fn artifact_version_is_current(
         &self,
         kind: ArtifactKind,
@@ -1545,15 +1628,43 @@ impl Store {
         key: &str,
         version_ms: u64,
     ) -> Result<bool, String> {
+        Ok(
+            self.artifact_apply_outcome(kind, namespace_id, key, version_ms)?
+                == ArtifactApplyOutcome::Applied,
+        )
+    }
+
+    pub fn artifact_apply_outcome(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        version_ms: u64,
+    ) -> Result<ArtifactApplyOutcome, String> {
         let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
         if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
-            return Ok(false);
+            return Ok(ArtifactApplyOutcome::IgnoredTombstone);
         }
 
         Ok(self
             .manifest_from_db(&artifact_id)?
-            .map(|manifest| manifest_version_ms(&manifest) < version_ms)
-            .unwrap_or(true))
+            .map(|manifest| {
+                if manifest_version_ms(&manifest) < version_ms {
+                    ArtifactApplyOutcome::Applied
+                } else {
+                    ArtifactApplyOutcome::IgnoredStale
+                }
+            })
+            .unwrap_or(ArtifactApplyOutcome::Applied))
+    }
+
+    pub(crate) async fn hit_failpoint(&self, name: FailpointName) -> Result<(), String> {
+        self.failpoints.hit(name).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failpoints(&self) -> Arc<FailpointSet> {
+        self.failpoints.clone()
     }
 
     fn cf(&self, name: &str) -> &ColumnFamily {
@@ -2055,6 +2166,7 @@ mod tests {
 
     use crate::{
         config::Config,
+        failpoints::{FailpointAction, FailpointName},
         io::IoController,
         memory::MemoryController,
         metrics::Metrics,
@@ -2598,10 +2710,11 @@ mod tests {
                 .apply_replicated_namespace_delete("ios", 200)
                 .await
                 .expect("namespace delete should apply")
+                .applied()
         );
 
-        assert!(
-            !store
+        assert_eq!(
+            store
                 .apply_replicated_artifact_from_bytes(
                     ArtifactKind::Gradle,
                     "ios",
@@ -2611,7 +2724,8 @@ mod tests {
                     100,
                 )
                 .await
-                .expect("stale artifact should be ignored")
+                .expect("stale artifact should be ignored"),
+            ArtifactApplyOutcome::IgnoredTombstone
         );
         assert!(
             !store
@@ -2643,6 +2757,7 @@ mod tests {
                 )
                 .await
                 .expect("old artifact should apply")
+                .applied()
         );
         assert!(
             store
@@ -2656,6 +2771,7 @@ mod tests {
                 )
                 .await
                 .expect("new artifact should apply")
+                .applied()
         );
 
         assert!(
@@ -2663,6 +2779,7 @@ mod tests {
                 .apply_replicated_namespace_delete("ios", 200)
                 .await
                 .expect("namespace delete should apply")
+                .applied()
         );
 
         assert!(
@@ -2697,6 +2814,7 @@ mod tests {
                 )
                 .await
                 .expect("initial artifact should apply")
+                .applied()
         );
         assert!(
             store
@@ -2710,8 +2828,9 @@ mod tests {
                 )
                 .await
                 .expect("newer artifact should apply")
+                .applied()
         );
-        assert!(
+        assert_eq!(
             store
                 .apply_replicated_artifact_from_bytes(
                     ArtifactKind::Xcode,
@@ -2722,7 +2841,8 @@ mod tests {
                     150,
                 )
                 .await
-                .expect("stale artifact should resolve cleanly")
+                .expect("stale artifact should resolve cleanly"),
+            ArtifactApplyOutcome::IgnoredStale
         );
 
         let manifest = store
@@ -2962,5 +3082,266 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn segment_backed_write_remains_visible_after_post_commit_error_and_restart() {
+        let (_temp_dir, config, store) = temp_store();
+        store.failpoints().set_once(
+            FailpointName::AfterMetadataCommitBeforeReturn,
+            FailpointAction::Error("post-commit failure".into()),
+        );
+
+        let error = store
+            .persist_artifact_from_bytes_and_enqueue(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"segment-bytes",
+                &["http://peer-a".to_string()],
+            )
+            .await
+            .expect_err("write should fail after the durable commit");
+        assert!(error.contains("post-commit failure"));
+
+        drop(store);
+
+        let reopened_metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
+        let reopened_io = IoController::new(
+            reopened_metrics,
+            config.file_descriptor_pool_size,
+            std::time::Duration::from_millis(config.file_descriptor_acquire_timeout_ms),
+        );
+        let reopened_memory = MemoryController::new(
+            reopened_io.metrics(),
+            config.memory_soft_limit_bytes,
+            config.memory_hard_limit_bytes,
+        );
+        let reopened =
+            Store::open(&config, reopened_io, reopened_memory).expect("failed to reopen store");
+
+        let manifest = reopened
+            .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact")
+            .await
+            .expect("artifact fetch should succeed")
+            .expect("artifact should remain visible after restart");
+        assert_eq!(
+            read_manifest_bytes(&reopened, &manifest).await,
+            b"segment-bytes"
+        );
+        assert_eq!(
+            reopened
+                .outbox_message_count()
+                .expect("outbox count should load"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn keyvalue_write_remains_visible_after_post_commit_error_and_restart() {
+        let (_temp_dir, config, store) = temp_store();
+        store.failpoints().set_once(
+            FailpointName::AfterMetadataCommitBeforeReturn,
+            FailpointAction::Error("post-commit failure".into()),
+        );
+
+        let error = store
+            .persist_artifact_from_bytes_and_enqueue(
+                ArtifactKind::Keyvalue,
+                "ios",
+                "cas-1",
+                "application/json",
+                br#"{"value":"ok"}"#,
+                &["http://peer-a".to_string()],
+            )
+            .await
+            .expect_err("write should fail after the durable commit");
+        assert!(error.contains("post-commit failure"));
+
+        drop(store);
+
+        let reopened_metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
+        let reopened_io = IoController::new(
+            reopened_metrics,
+            config.file_descriptor_pool_size,
+            std::time::Duration::from_millis(config.file_descriptor_acquire_timeout_ms),
+        );
+        let reopened_memory = MemoryController::new(
+            reopened_io.metrics(),
+            config.memory_soft_limit_bytes,
+            config.memory_hard_limit_bytes,
+        );
+        let reopened =
+            Store::open(&config, reopened_io, reopened_memory).expect("failed to reopen store");
+
+        let manifest = reopened
+            .fetch_artifact(ArtifactKind::Keyvalue, "ios", "cas-1")
+            .await
+            .expect("artifact fetch should succeed")
+            .expect("keyvalue should remain visible after restart");
+        assert_eq!(
+            read_manifest_bytes(&reopened, &manifest).await,
+            br#"{"value":"ok"}"#
+        );
+        assert_eq!(
+            reopened
+                .outbox_message_count()
+                .expect("outbox count should load"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_replicated_upserts_and_deletes_are_idempotent() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        assert_eq!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Gradle,
+                    "ios",
+                    "artifact",
+                    "application/octet-stream",
+                    b"payload",
+                    100,
+                )
+                .await
+                .expect("first artifact apply should succeed"),
+            ArtifactApplyOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .apply_replicated_artifact_from_bytes(
+                    ArtifactKind::Gradle,
+                    "ios",
+                    "artifact",
+                    "application/octet-stream",
+                    b"payload",
+                    100,
+                )
+                .await
+                .expect("duplicate artifact apply should succeed"),
+            ArtifactApplyOutcome::IgnoredStale
+        );
+        assert_eq!(
+            store
+                .apply_replicated_namespace_delete("ios", 150)
+                .await
+                .expect("first delete should succeed"),
+            NamespaceDeleteOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .apply_replicated_namespace_delete("ios", 150)
+                .await
+                .expect("duplicate delete should succeed"),
+            NamespaceDeleteOutcome::IgnoredOlder
+        );
+        assert!(
+            store
+                .fetch_artifact(ArtifactKind::Gradle, "ios", "artifact")
+                .await
+                .expect("artifact fetch should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reordered_delivery_converges_to_the_same_winner() {
+        let (_temp_dir_a, _config_a, first) = temp_store();
+        let (_temp_dir_b, _config_b, second) = temp_store();
+
+        first
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"v1",
+                100,
+            )
+            .await
+            .expect("initial write should succeed");
+        first
+            .apply_replicated_namespace_delete("ios", 150)
+            .await
+            .expect("delete should succeed");
+        first
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"v1",
+                100,
+            )
+            .await
+            .expect("duplicate stale write should succeed");
+        first
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"v2",
+                200,
+            )
+            .await
+            .expect("newer write should succeed");
+
+        second
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"v2",
+                200,
+            )
+            .await
+            .expect("newer write should succeed");
+        second
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"v1",
+                100,
+            )
+            .await
+            .expect("older duplicate write should succeed");
+        second
+            .apply_replicated_namespace_delete("ios", 150)
+            .await
+            .expect("delete should succeed");
+        second
+            .apply_replicated_artifact_from_bytes(
+                ArtifactKind::Xcode,
+                "ios",
+                "artifact",
+                "application/octet-stream",
+                b"v1",
+                100,
+            )
+            .await
+            .expect("older duplicate write should succeed");
+
+        let first_manifest = first
+            .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact")
+            .await
+            .expect("first fetch should succeed")
+            .expect("artifact should remain");
+        let second_manifest = second
+            .fetch_artifact(ArtifactKind::Xcode, "ios", "artifact")
+            .await
+            .expect("second fetch should succeed")
+            .expect("artifact should remain");
+
+        assert_eq!(first_manifest.version_ms, 200);
+        assert_eq!(second_manifest.version_ms, 200);
+        assert_eq!(read_manifest_bytes(&first, &first_manifest).await, b"v2");
+        assert_eq!(read_manifest_bytes(&second, &second_manifest).await, b"v2");
     }
 }

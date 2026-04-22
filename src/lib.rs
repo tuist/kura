@@ -4,6 +4,7 @@ mod artifact;
 mod config;
 mod constants;
 mod extension;
+mod failpoints;
 mod http;
 mod io;
 mod memory;
