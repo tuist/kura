@@ -71,7 +71,8 @@ Kura is easier to read by subsystem than by tutorial step. The sections below gr
 - 🔌 [Protocol surfaces](#-protocol-surfaces)
 - 🗄️ [Storage and replication](#-storage-and-replication)
 - ⚙️ [Runtime model and limits](#-runtime-model-and-limits)
-- 📊 [Observability and analytics](#-observability-and-analytics)
+- 📊 [Observability](#-observability)
+- 📣 [Runtime analytics](#-runtime-analytics)
 - ☸️ [Deployment options](#-deployment-options)
 - 🧩 [Extensions and policy](#-extensions-and-policy)
 
@@ -216,7 +217,7 @@ KURA_OTEL_DEPLOYMENT_ENVIRONMENT=production \
 ./target/release/kura
 ```
 
-## 📊 Observability And Analytics
+## 📊 Observability
 
 Kura ships with a fairly complete local observability story:
 
@@ -239,7 +240,8 @@ Kura also exports:
 - 🔁 replication latency and result metrics
 - 💾 file descriptor pool pressure metrics
 - 🧠 manifest cache occupancy and admission metrics
-- 📣 analytics queue, batch, and circuit-breaker metrics
+
+## 📣 Runtime Analytics
 
 Analytics webhooks are a separate optional subsystem that mirrors the older Tuist cache contract for Xcode and Gradle traffic.
 
@@ -262,6 +264,12 @@ Configure it with:
 - optional `KURA_ANALYTICS_REQUEST_TIMEOUT_MS` default `5000`
 - optional `KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD` default `5`
 - optional `KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS` default `30000`
+
+It also exposes analytics-specific runtime metrics for:
+
+- 📣 queue depth and drops
+- 📦 batch sizes and flush outcomes
+- 🧯 circuit-breaker state and open events
 
 ## ☸️ Deployment Options
 
@@ -372,54 +380,3 @@ The script may define these hooks:
 - `response_headers(ctx, principal)`
 
 The runtime keeps decision caching, metrics, timeouts, and cryptographic primitives in Rust, while the script supplies policy.
-
-<a id="reference"></a>
-## 📖 Reference
-
-### ⚙️ Runtime config reference
-
-See the runtime configuration table in [Runtime Model And Limits](#-runtime-model-and-limits) for the current required and optional variables.
-
-### 📊 Metrics reference
-
-Prometheus exposes live metadata-store memory gauges:
-
-- `kura_rocksdb_block_cache_usage_bytes`
-- `kura_rocksdb_block_cache_pinned_usage_bytes`
-- `kura_rocksdb_block_cache_capacity_bytes`
-- `kura_rocksdb_write_buffer_usage_bytes`
-- `kura_rocksdb_write_buffer_capacity_bytes`
-
-Kura also exports:
-
-- 📦 artifact read and write counters by `kind`, `client`, `artifact_class`, and `result`
-- 🔁 replication latency and result metrics
-- 💾 file descriptor pool pressure metrics
-- 🧠 manifest cache occupancy and admission metrics
-- 📣 analytics queue, batch, and circuit-breaker metrics
-
-### 🌍 Deployment references
-
-For Scaleway, start from the bundled overrides in `ops/helm/kura/values-scaleway.yaml`:
-
-```bash
-helm upgrade --install kura ./ops/helm/kura \
-  --namespace kura \
-  --create-namespace \
-  -f ./ops/helm/kura/values-scaleway.yaml \
-  --set image.repository=ghcr.io/tuist/kura \
-  --set image.tag=latest \
-  --set config.region=fr-par \
-  --set config.telemetry.otlpTracesEndpoint=http://otel-collector.monitoring.svc.cluster.local:4318/v1/traces
-```
-
-That values file does two important things:
-
-- 🚪 uses a `LoadBalancer` service, which is the simplest way to expose Kura on Kapsule
-- 💾 pins persistence to `scw-bssd`, which Scaleway documents as the default block storage class for Kapsule multi-AZ clusters
-
-Useful external references:
-
-- [Scaleway multi-AZ storage guidance](https://www.scaleway.com/en/docs/kubernetes/reference-content/multi-az-clusters/)
-- [Scaleway LoadBalancer annotations](https://www.scaleway.com/en/docs/kubernetes/reference-content/using-load-balancer-annotations/)
-- [Scaleway NGINX ingress with Kapsule](https://www.scaleway.com/en/docs/kubernetes/reference-content/lb-ingress-controller/)
