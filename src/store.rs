@@ -10,8 +10,9 @@ use futures_util::stream;
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex,
 };
 use tokio_util::io::StreamReader;
@@ -19,7 +20,8 @@ use uuid::Uuid;
 
 use crate::{
     artifact::{
-        kind::ArtifactKind, manifest::ArtifactManifest,
+        kind::ArtifactKind,
+        manifest::{ArtifactManifest, PersistedManifestRecord},
         segment_location_record::SegmentLocationRecord,
     },
     config::Config,
@@ -33,7 +35,7 @@ use crate::{
     io::{IoController, PersistentFile},
     memory::MemoryController,
     multipart::{error::MultipartError, part::MultipartPart, upload::MultipartUpload},
-    replication::outbox_message::OutboxMessage,
+    replication::{operation::ReplicationOperation, outbox_message::OutboxMessage},
     segment::{
         generation::SegmentGeneration, reader::SegmentReader, reference::SegmentReference,
         state::SegmentState,
@@ -61,6 +63,24 @@ pub struct StoreSnapshot {
     pub outbox_messages: usize,
     pub multipart_uploads: usize,
     pub segment_counts: Vec<(ArtifactKind, &'static str, usize)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestPage {
+    pub manifests: Vec<ArtifactManifest>,
+    pub next_after: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceTombstoneRecord {
+    pub namespace_id: String,
+    pub version_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceTombstonePage {
+    pub tombstones: Vec<NamespaceTombstoneRecord>,
+    pub next_after: Option<String>,
 }
 
 impl Store {
@@ -160,13 +180,14 @@ impl Store {
         }
     }
 
-    pub async fn persist_artifact_from_path(
+    pub async fn persist_artifact_from_path_and_enqueue(
         &self,
         kind: ArtifactKind,
         namespace_id: &str,
         key: &str,
         content_type: &str,
         source_path: &Path,
+        replication_targets: &[String],
     ) -> Result<ArtifactManifest, String> {
         let version_ms = now_ms();
         self.persist_artifact_from_path_with_version(
@@ -176,6 +197,7 @@ impl Store {
             content_type,
             source_path,
             version_ms,
+            replication_targets,
         )
         .await?
         .ok_or_else(|| {
@@ -202,6 +224,7 @@ impl Store {
                 content_type,
                 source_path,
                 version_ms,
+                &[],
             )
             .await?
             .is_some())
@@ -215,6 +238,7 @@ impl Store {
         content_type: &str,
         source_path: &Path,
         version_ms: u64,
+        replication_targets: &[String],
     ) -> Result<Option<ArtifactManifest>, String> {
         if kind == ArtifactKind::Keyvalue {
             let bytes = self.io.read(source_path).await?;
@@ -226,6 +250,7 @@ impl Store {
                     content_type,
                     &bytes,
                     version_ms,
+                    replication_targets,
                 )
                 .await;
         }
@@ -333,6 +358,7 @@ impl Store {
                 [],
             );
         }
+        self.append_artifact_replication_messages(&mut batch, &manifest, replication_targets)?;
 
         self.write_batch_sync(batch, "manifest batch")?;
         self.maybe_cache_manifest(manifest.clone());
@@ -346,17 +372,50 @@ impl Store {
         &self,
         manifest: &ArtifactManifest,
     ) -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
-        self.open_manifest_reader(manifest).await
+        self.open_manifest_reader_with_range(manifest, 0, None)
+            .await
+    }
+
+    pub async fn open_artifact_reader_range(
+        &self,
+        manifest: &ArtifactManifest,
+        read_offset: u64,
+        read_limit: Option<u64>,
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+        self.open_manifest_reader_with_range(manifest, read_offset, read_limit)
+            .await
     }
 
     async fn open_manifest_reader(
         &self,
         manifest: &ArtifactManifest,
     ) -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+        self.open_manifest_reader_with_range(manifest, 0, None)
+            .await
+    }
+
+    async fn open_manifest_reader_with_range(
+        &self,
+        manifest: &ArtifactManifest,
+        read_offset: u64,
+        read_limit: Option<u64>,
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+        if read_offset > manifest.size {
+            return Err(format!(
+                "requested read offset {read_offset} exceeds artifact size {}",
+                manifest.size
+            ));
+        }
+        let readable_bytes = manifest.size.saturating_sub(read_offset);
+        let limit = read_limit.unwrap_or(readable_bytes).min(readable_bytes);
+
         if manifest.kind == ArtifactKind::Keyvalue {
             if let Some(bytes) = self.keyvalue_bytes(&manifest.artifact_id)? {
-                let stream =
-                    stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(bytes)) });
+                let start = read_offset as usize;
+                let end = start.saturating_add(limit as usize).min(bytes.len());
+                let stream = stream::once(async move {
+                    Ok::<Bytes, std::io::Error>(Bytes::from(bytes[start..end].to_vec()))
+                });
                 return Ok(Box::pin(StreamReader::new(stream)));
             }
         }
@@ -366,16 +425,23 @@ impl Store {
                 .segment_offset
                 .ok_or_else(|| "segment-backed manifest is missing segment offset".to_string())?;
             let handle = self.segment_handle(manifest.kind, segment_id).await?;
-            return Ok(Box::pin(SegmentReader::new(handle, offset, manifest.size)));
+            return Ok(Box::pin(SegmentReader::new(
+                handle,
+                offset + read_offset,
+                limit,
+            )));
         }
 
         if let Some(blob_path) = &manifest.blob_path {
-            let file = self
+            let mut file = self
                 .io
                 .open_file(Path::new(blob_path))
                 .await
                 .map_err(|error| format!("failed to open blob {blob_path} for read: {error}"))?;
-            return Ok(Box::pin(file.take(manifest.size)));
+            file.seek(std::io::SeekFrom::Start(read_offset))
+                .await
+                .map_err(|error| format!("failed to seek blob {blob_path}: {error}"))?;
+            return Ok(Box::pin(file.take(limit)));
         }
 
         Err("manifest does not have a readable storage location".to_string())
@@ -486,6 +552,7 @@ impl Store {
         content_type: &str,
         bytes: &[u8],
         version_ms: u64,
+        replication_targets: &[String],
     ) -> Result<Option<ArtifactManifest>, String> {
         let artifact_id =
             artifact_storage_id(ArtifactKind::Keyvalue, &self.tenant_id, namespace_id, key);
@@ -537,6 +604,7 @@ impl Store {
             namespace_artifact_index_key(&metadata.namespace_id, &artifact_id).as_bytes(),
             [],
         );
+        self.append_artifact_replication_messages(&mut batch, &manifest, replication_targets)?;
 
         self.write_batch_sync(batch, "keyvalue batch")?;
         self.maybe_cache_manifest(manifest.clone());
@@ -674,14 +742,8 @@ impl Store {
             return Ok(SegmentState::default());
         };
 
-        match serde_json::from_slice::<SegmentState>(&bytes) {
-            Ok(state) => Ok(state),
-            Err(_) => {
-                let segment_id = String::from_utf8(bytes.to_vec())
-                    .map_err(|error| format!("segment state is not valid utf-8: {error}"))?;
-                Ok(SegmentState::from_legacy_active(segment_id, now_ms()))
-            }
-        }
+        serde_json::from_slice::<SegmentState>(&bytes)
+            .map_err(|error| format!("failed to decode segment state: {error}"))
     }
 
     fn save_segment_state(&self, kind: ArtifactKind, state: &SegmentState) -> Result<(), String> {
@@ -829,6 +891,7 @@ impl Store {
         cache.touch(cache_key)
     }
 
+    #[cfg(test)]
     pub async fn persist_artifact_from_bytes(
         &self,
         kind: ArtifactKind,
@@ -845,6 +908,34 @@ impl Store {
             content_type,
             bytes,
             version_ms,
+            &[],
+        )
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "artifact write for {kind:?}/{namespace_id}/{key} was rejected by a newer tombstone"
+            )
+        })
+    }
+
+    pub async fn persist_artifact_from_bytes_and_enqueue(
+        &self,
+        kind: ArtifactKind,
+        namespace_id: &str,
+        key: &str,
+        content_type: &str,
+        bytes: &[u8],
+        replication_targets: &[String],
+    ) -> Result<ArtifactManifest, String> {
+        let version_ms = now_ms();
+        self.persist_artifact_from_bytes_with_version(
+            kind,
+            namespace_id,
+            key,
+            content_type,
+            bytes,
+            version_ms,
+            replication_targets,
         )
         .await?
         .ok_or_else(|| {
@@ -871,6 +962,7 @@ impl Store {
                 content_type,
                 bytes,
                 version_ms,
+                &[],
             )
             .await?
             .is_some())
@@ -884,6 +976,7 @@ impl Store {
         content_type: &str,
         bytes: &[u8],
         version_ms: u64,
+        replication_targets: &[String],
     ) -> Result<Option<ArtifactManifest>, String> {
         if kind == ArtifactKind::Keyvalue {
             return self
@@ -893,6 +986,7 @@ impl Store {
                     content_type,
                     bytes,
                     version_ms,
+                    replication_targets,
                 )
                 .await;
         }
@@ -906,13 +1000,26 @@ impl Store {
             content_type,
             &temp_path,
             version_ms,
+            replication_targets,
         )
         .await
     }
 
+    #[cfg(test)]
     pub async fn delete_namespace(&self, namespace_id: &str) -> Result<u64, String> {
         let version_ms = now_ms();
-        self.delete_namespace_with_version(namespace_id, version_ms)
+        self.delete_namespace_with_version(namespace_id, version_ms, &[])
+            .await
+            .map(|_| version_ms)
+    }
+
+    pub async fn delete_namespace_and_enqueue(
+        &self,
+        namespace_id: &str,
+        replication_targets: &[String],
+    ) -> Result<u64, String> {
+        let version_ms = now_ms();
+        self.delete_namespace_with_version(namespace_id, version_ms, replication_targets)
             .await
             .map(|_| version_ms)
     }
@@ -922,7 +1029,7 @@ impl Store {
         namespace_id: &str,
         version_ms: u64,
     ) -> Result<bool, String> {
-        self.delete_namespace_with_version(namespace_id, version_ms)
+        self.delete_namespace_with_version(namespace_id, version_ms, &[])
             .await
     }
 
@@ -930,6 +1037,7 @@ impl Store {
         &self,
         namespace_id: &str,
         version_ms: u64,
+        replication_targets: &[String],
     ) -> Result<bool, String> {
         let prefix = format!("{namespace_id}\0");
         let mut batch = WriteBatch::default();
@@ -988,6 +1096,15 @@ impl Store {
             batch.delete_cf(self.cf(ROCKSDB_CF_NAMESPACE_ARTIFACTS), index_key);
             batch.delete_cf(self.cf(ROCKSDB_CF_MANIFESTS), artifact_id.as_bytes());
             removed_artifact_ids.push(artifact_id);
+        }
+
+        if !delete_everything {
+            self.append_namespace_delete_messages(
+                &mut batch,
+                namespace_id,
+                version_ms,
+                replication_targets,
+            )?;
         }
 
         self.write_batch_sync(batch, "delete namespace batch")?;
@@ -1100,10 +1217,21 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn complete_multipart_upload(
         &self,
         upload_id: &str,
         expected_parts: &[u32],
+    ) -> Result<ArtifactManifest, MultipartError> {
+        self.complete_multipart_upload_and_enqueue(upload_id, expected_parts, &[])
+            .await
+    }
+
+    pub async fn complete_multipart_upload_and_enqueue(
+        &self,
+        upload_id: &str,
+        expected_parts: &[u32],
+        replication_targets: &[String],
     ) -> Result<ArtifactManifest, MultipartError> {
         let upload = self
             .multipart_upload(upload_id)
@@ -1142,12 +1270,13 @@ impl Store {
 
         let key = module_key(&upload.category, &upload.hash, &upload.name);
         let manifest = self
-            .persist_artifact_from_path(
+            .persist_artifact_from_path_and_enqueue(
                 ArtifactKind::Module,
                 &upload.namespace_id,
                 &key,
                 "application/octet-stream",
                 &assembled_path,
+                replication_targets,
             )
             .await
             .map_err(MultipartError::Other)?;
@@ -1176,6 +1305,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn enqueue(&self, message: OutboxMessage) -> Result<(), String> {
         let key = format!("{:020}-{}", now_ms(), Uuid::now_v7());
         let value = serde_json::to_vec(&message)
@@ -1217,6 +1347,89 @@ impl Store {
         })
     }
 
+    pub fn manifests_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<ManifestPage, String> {
+        let mut manifests = Vec::new();
+        let mut next_after = None;
+        let start_key = after.unwrap_or_default();
+        let iter = self.db.iterator_cf(
+            self.cf(ROCKSDB_CF_MANIFESTS),
+            IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        for item in iter {
+            let (artifact_id, payload) =
+                item.map_err(|error| format!("failed to iterate manifests: {error}"))?;
+            let artifact_id = std::str::from_utf8(&artifact_id)
+                .map_err(|error| format!("invalid manifest key: {error}"))?;
+            if after == Some(artifact_id) {
+                continue;
+            }
+            if manifests.len() == limit {
+                next_after = manifests
+                    .last()
+                    .map(|manifest: &ArtifactManifest| manifest.artifact_id.clone());
+                break;
+            }
+            manifests.push(decode_manifest_record(artifact_id, &payload)?);
+        }
+
+        Ok(ManifestPage {
+            manifests,
+            next_after,
+        })
+    }
+
+    pub fn namespace_tombstones_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<NamespaceTombstonePage, String> {
+        let mut tombstones = Vec::new();
+        let mut next_after = None;
+        let start_key = after.unwrap_or_default();
+        let iter = self.db.iterator_cf(
+            self.cf(ROCKSDB_CF_NAMESPACE_TOMBSTONES),
+            IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        for item in iter {
+            let (namespace_id, payload) =
+                item.map_err(|error| format!("failed to iterate namespace tombstones: {error}"))?;
+            let namespace_id = std::str::from_utf8(&namespace_id)
+                .map_err(|error| format!("invalid namespace tombstone key: {error}"))?;
+            if after == Some(namespace_id) {
+                continue;
+            }
+            if tombstones.len() == limit {
+                next_after = tombstones
+                    .last()
+                    .map(|record: &NamespaceTombstoneRecord| record.namespace_id.clone());
+                break;
+            }
+            if payload.len() != 8 {
+                return Err(format!(
+                    "namespace tombstone for {namespace_id} should be 8 bytes, got {}",
+                    payload.len()
+                ));
+            }
+            let mut slice = [0_u8; 8];
+            slice.copy_from_slice(payload.as_ref());
+            tombstones.push(NamespaceTombstoneRecord {
+                namespace_id: namespace_id.to_owned(),
+                version_ms: u64::from_le_bytes(slice),
+            });
+        }
+
+        Ok(NamespaceTombstonePage {
+            tombstones,
+            next_after,
+        })
+    }
+
     pub fn delete_outbox_message(&self, key: &[u8]) -> Result<(), String> {
         self.db
             .delete_cf(self.cf(ROCKSDB_CF_OUTBOX), key)
@@ -1245,6 +1458,65 @@ impl Store {
         self.db
             .cf_handle(name)
             .expect("missing RocksDB column family")
+    }
+
+    fn append_artifact_replication_messages(
+        &self,
+        batch: &mut WriteBatch,
+        manifest: &ArtifactManifest,
+        replication_targets: &[String],
+    ) -> Result<(), String> {
+        for target in replication_targets {
+            self.append_outbox_message(
+                batch,
+                OutboxMessage {
+                    target: target.clone(),
+                    operation: ReplicationOperation::UpsertArtifact {
+                        kind: manifest.kind,
+                        namespace_id: manifest.namespace_id.clone(),
+                        key: manifest.key.clone(),
+                        content_type: manifest.content_type.clone(),
+                        artifact_id: manifest.artifact_id.clone(),
+                        version_ms: manifest.version_ms,
+                    },
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn append_namespace_delete_messages(
+        &self,
+        batch: &mut WriteBatch,
+        namespace_id: &str,
+        version_ms: u64,
+        replication_targets: &[String],
+    ) -> Result<(), String> {
+        for target in replication_targets {
+            self.append_outbox_message(
+                batch,
+                OutboxMessage {
+                    target: target.clone(),
+                    operation: ReplicationOperation::DeleteNamespace {
+                        namespace_id: namespace_id.to_owned(),
+                        version_ms,
+                    },
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn append_outbox_message(
+        &self,
+        batch: &mut WriteBatch,
+        message: OutboxMessage,
+    ) -> Result<(), String> {
+        let key = format!("{:020}-{}", now_ms(), Uuid::now_v7());
+        let value = serde_json::to_vec(&message)
+            .map_err(|error| format!("failed to encode outbox message: {error}"))?;
+        batch.put_cf(self.cf(ROCKSDB_CF_OUTBOX), key.as_bytes(), value);
+        Ok(())
     }
 
     fn write_batch_sync(&self, batch: WriteBatch, label: &str) -> Result<(), String> {
@@ -1631,26 +1903,18 @@ fn encode_manifest_record(manifest: &ArtifactManifest) -> Result<Vec<u8>, String
         return SegmentLocationRecord::from_manifest(manifest).map(|record| record.encode());
     }
 
-    serde_json::to_vec(manifest).map_err(|error| format!("failed to encode manifest: {error}"))
+    serde_json::to_vec(&PersistedManifestRecord::from_manifest(manifest))
+        .map_err(|error| format!("failed to encode manifest: {error}"))
 }
 
 fn decode_manifest_record(artifact_id: &str, bytes: &[u8]) -> Result<ArtifactManifest, String> {
     if let Some(manifest) = SegmentLocationRecord::decode(bytes, artifact_id)? {
-        return Ok(normalize_manifest_version(manifest));
+        return Ok(manifest);
     }
 
-    serde_json::from_slice(bytes)
-        .map(normalize_manifest_version)
-        .map_err(|error| format!("failed to decode manifest: {error}"))
-}
-
-fn normalize_manifest_version(mut manifest: ArtifactManifest) -> ArtifactManifest {
-    if manifest.version_ms == 0 {
-        manifest.version_ms = manifest.created_at_ms;
-    }
-    manifest.client = manifest.kind.client();
-    manifest.artifact_class = manifest.kind.artifact_class();
-    manifest
+    serde_json::from_slice::<PersistedManifestRecord>(bytes)
+        .map_err(|error| format!("failed to decode manifest: {error}"))?
+        .into_manifest(artifact_id)
 }
 
 #[cfg(test)]
@@ -1679,12 +1943,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let mut config = Config {
             port: 0,
+            grpc_port: 0,
             tenant_id: "test-tenant".into(),
             region: "local".into(),
             tmp_dir: temp_dir.path().join("tmp"),
             data_dir: temp_dir.path().join("data"),
             node_url: "http://127.0.0.1:0".into(),
             peers: vec!["http://127.0.0.1:0".into()],
+            discovery_dns_name: None,
             file_descriptor_pool_size: 32,
             file_descriptor_acquire_timeout_ms: 5_000,
             segment_handle_cache_size: 8,
@@ -1776,7 +2042,7 @@ mod tests {
             .expect("failed to read raw manifest bytes")
             .expect("manifest bytes should exist");
         assert_eq!(
-            raw[0], 3,
+            raw[0], 1,
             "segment-backed manifest should use compact record"
         );
     }
@@ -1863,6 +2129,82 @@ mod tests {
             read_manifest_bytes(&reopened, &rebuilt).await,
             b"module-bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn manifests_page_returns_results_in_artifact_id_order() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        let first = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Keyvalue,
+                "ios",
+                "action-a",
+                "application/json",
+                br#"{"a":1}"#,
+            )
+            .await
+            .expect("failed to persist first artifact");
+        let second = store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Gradle,
+                "ios",
+                "artifact-b",
+                "application/octet-stream",
+                b"gradle",
+            )
+            .await
+            .expect("failed to persist second artifact");
+
+        let first_page = store
+            .manifests_page(None, 1)
+            .expect("failed to load first manifest page");
+        assert_eq!(first_page.manifests.len(), 1);
+        assert!(
+            first_page.manifests[0].artifact_id == first.artifact_id
+                || first_page.manifests[0].artifact_id == second.artifact_id
+        );
+        assert_eq!(
+            first_page.next_after,
+            Some(first_page.manifests[0].artifact_id.clone())
+        );
+
+        let second_page = store
+            .manifests_page(first_page.next_after.as_deref(), 1)
+            .expect("failed to load second manifest page");
+        assert_eq!(second_page.manifests.len(), 1);
+        assert_ne!(
+            second_page.manifests[0].artifact_id,
+            first_page.manifests[0].artifact_id
+        );
+        assert!(
+            second_page.manifests[0].artifact_id == first.artifact_id
+                || second_page.manifests[0].artifact_id == second.artifact_id
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_tombstones_page_returns_written_tombstones() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        store
+            .apply_replicated_namespace_delete("ios", 100)
+            .await
+            .expect("failed to apply first tombstone");
+        store
+            .apply_replicated_namespace_delete("android", 200)
+            .await
+            .expect("failed to apply second tombstone");
+
+        let page = store
+            .namespace_tombstones_page(None, 8)
+            .expect("failed to load tombstone page");
+        assert_eq!(page.tombstones.len(), 2);
+        assert_eq!(page.tombstones[0].namespace_id, "android");
+        assert_eq!(page.tombstones[0].version_ms, 200);
+        assert_eq!(page.tombstones[1].namespace_id, "ios");
+        assert_eq!(page.tombstones[1].version_ms, 100);
+        assert_eq!(page.next_after, None);
     }
 
     #[tokio::test]
@@ -2360,5 +2702,87 @@ mod tests {
                 .expect("failed to read outbox messages")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn local_write_enqueues_replication_targets_in_same_store_operation() {
+        let (_temp_dir, _config, store) = temp_store();
+        let targets = vec!["http://peer-a".to_string(), "http://peer-b".to_string()];
+
+        let manifest = store
+            .persist_artifact_from_bytes_and_enqueue(
+                ArtifactKind::Keyvalue,
+                "ios",
+                "cas-1",
+                "application/json",
+                br#"{"ok":true}"#,
+                &targets,
+            )
+            .await
+            .expect("artifact should persist");
+
+        let queued = store
+            .outbox_messages()
+            .expect("outbox messages should load")
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect::<Vec<_>>();
+
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].target, "http://peer-a");
+        assert_eq!(queued[1].target, "http://peer-b");
+        for message in queued {
+            assert_eq!(
+                message.operation,
+                ReplicationOperation::UpsertArtifact {
+                    kind: ArtifactKind::Keyvalue,
+                    namespace_id: "ios".into(),
+                    key: "cas-1".into(),
+                    content_type: "application/json".into(),
+                    artifact_id: manifest.artifact_id.clone(),
+                    version_ms: manifest.version_ms,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_namespace_delete_enqueues_replication_targets_in_same_store_operation() {
+        let (_temp_dir, _config, store) = temp_store();
+        let targets = vec!["http://peer-a".to_string(), "http://peer-b".to_string()];
+
+        store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Keyvalue,
+                "ios",
+                "cas-1",
+                "application/json",
+                br#"{"ok":true}"#,
+            )
+            .await
+            .expect("artifact should persist");
+
+        let version_ms = store
+            .delete_namespace_and_enqueue("ios", &targets)
+            .await
+            .expect("namespace delete should succeed");
+
+        let queued = store
+            .outbox_messages()
+            .expect("outbox messages should load")
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect::<Vec<_>>();
+
+        assert_eq!(queued.len(), 2);
+        for message in queued {
+            assert_eq!(
+                message.operation,
+                ReplicationOperation::DeleteNamespace {
+                    namespace_id: "ios".into(),
+                    version_ms,
+                }
+            );
+        }
     }
 }

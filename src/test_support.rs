@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::response::Response;
 use http_body_util::BodyExt;
@@ -7,8 +11,8 @@ use tempfile::TempDir;
 use tokio::sync::{Notify, RwLock};
 
 use crate::{
-    config::Config, io::IoController, memory::MemoryController, metrics::Metrics, state::AppState,
-    store::Store,
+    config::Config, extension::SharedExtension, io::IoController, memory::MemoryController,
+    metrics::Metrics, state::AppState, store::Store,
 };
 
 pub(crate) struct TestContext {
@@ -20,15 +24,27 @@ pub(crate) async fn test_context<F>(override_config: F) -> TestContext
 where
     F: FnOnce(&mut Config),
 {
+    test_context_with_extension(override_config, None).await
+}
+
+pub(crate) async fn test_context_with_extension<F>(
+    override_config: F,
+    extension: Option<SharedExtension>,
+) -> TestContext
+where
+    F: FnOnce(&mut Config),
+{
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let mut config = Config {
         port: 0,
+        grpc_port: 0,
         tenant_id: "test-tenant".into(),
         region: "local".into(),
         tmp_dir: temp_dir.path().join("tmp"),
         data_dir: temp_dir.path().join("data"),
         node_url: "http://127.0.0.1:0".into(),
         peers: vec!["http://127.0.0.1:0".into()],
+        discovery_dns_name: None,
         file_descriptor_pool_size: 32,
         file_descriptor_acquire_timeout_ms: 5_000,
         segment_handle_cache_size: 8,
@@ -71,9 +87,12 @@ where
         io,
         memory,
         metrics,
+        extension,
         client,
         notify: Notify::new(),
         members: RwLock::new(BTreeSet::new()),
+        peer_nodes: RwLock::new(BTreeMap::new()),
+        bootstrapped_peers: tokio::sync::Mutex::new(BTreeSet::new()),
     });
 
     TestContext {

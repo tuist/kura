@@ -7,12 +7,14 @@ services:
     domainname: kura.internal
     environment: &kura_env
       KURA_PORT: "4000"
+      KURA_GRPC_PORT: "50051"
       KURA_TENANT_ID: default
       KURA_TMP_DIR: /tmp/kura
       KURA_DATA_DIR: /var/cache/kura
       KURA_REGION: us-east
       KURA_NODE_URL: http://kura-us.kura.internal:4000
       KURA_PEERS: http://kura-us.kura.internal:4000,http://kura-eu.kura.internal:4000,http://kura-ap.kura.internal:4000
+      KURA_DISCOVERY_DNS_NAME: kura-ring.kura.internal
       KURA_FILE_DESCRIPTOR_POOL_SIZE: "128"
       KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS: "5000"
       KURA_SEGMENT_HANDLE_CACHE_SIZE: "32"
@@ -35,12 +37,14 @@ services:
       kura.tenant_id: default
     ports:
       - "${KURA_US_PORT:-4101}:4000"
+      - "${KURA_US_GRPC_PORT:-5101}:50051"
     volumes:
       - kura-us-data:/var/cache/kura
     networks:
       default:
         aliases:
           - kura-us.kura.internal
+          - kura-ring.kura.internal
 
   kura-eu:
     build:
@@ -67,12 +71,14 @@ services:
       kura.tenant_id: default
     ports:
       - "${KURA_EU_PORT:-4102}:4000"
+      - "${KURA_EU_GRPC_PORT:-5102}:50051"
     volumes:
       - kura-eu-data:/var/cache/kura
     networks:
       default:
         aliases:
           - kura-eu.kura.internal
+          - kura-ring.kura.internal
 
   kura-ap:
     build:
@@ -99,12 +105,14 @@ services:
       kura.tenant_id: default
     ports:
       - "${KURA_AP_PORT:-4103}:4000"
+      - "${KURA_AP_GRPC_PORT:-5103}:50051"
     volumes:
       - kura-ap-data:/var/cache/kura
     networks:
       default:
         aliases:
           - kura-ap.kura.internal
+          - kura-ring.kura.internal
 
   prometheus:
     image: prom/prometheus:v3.11.2

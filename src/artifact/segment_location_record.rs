@@ -2,13 +2,10 @@ use crate::artifact::{
     class::ArtifactClass, client::ArtifactClient, kind::ArtifactKind, manifest::ArtifactManifest,
 };
 
-const SEGMENT_LOCATION_RECORD_VERSION_V1: u8 = 1;
-const SEGMENT_LOCATION_RECORD_VERSION_V2: u8 = 2;
-const SEGMENT_LOCATION_RECORD_VERSION_V3: u8 = 3;
+const SEGMENT_LOCATION_RECORD_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentLocationRecord {
-    pub kind: ArtifactKind,
     pub client: ArtifactClient,
     pub artifact_class: ArtifactClass,
     pub namespace_id: String,
@@ -32,7 +29,6 @@ impl SegmentLocationRecord {
             .ok_or_else(|| "segment-backed manifest is missing segment offset".to_string())?;
 
         Ok(Self {
-            kind: manifest.kind,
             client: manifest.client,
             artifact_class: manifest.artifact_class,
             namespace_id: manifest.namespace_id.clone(),
@@ -46,10 +42,12 @@ impl SegmentLocationRecord {
         })
     }
 
-    pub fn into_manifest(self, artifact_id: &str) -> ArtifactManifest {
-        ArtifactManifest {
+    pub fn into_manifest(self, artifact_id: &str) -> Result<ArtifactManifest, String> {
+        let kind = ArtifactKind::from_dimensions(self.client, self.artifact_class)?;
+
+        Ok(ArtifactManifest {
             artifact_id: artifact_id.to_owned(),
-            kind: self.kind,
+            kind,
             client: self.client,
             artifact_class: self.artifact_class,
             namespace_id: self.namespace_id,
@@ -61,12 +59,12 @@ impl SegmentLocationRecord {
             size: self.size,
             version_ms: self.version_ms,
             created_at_ms: self.created_at_ms,
-        }
+        })
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(
-            2 + 8
+            3 + 8
                 + 8
                 + 8
                 + self.namespace_id.len()
@@ -75,8 +73,7 @@ impl SegmentLocationRecord {
                 + self.segment_id.len()
                 + 16,
         );
-        bytes.push(SEGMENT_LOCATION_RECORD_VERSION_V3);
-        bytes.push(kind_code(self.kind));
+        bytes.push(SEGMENT_LOCATION_RECORD_VERSION);
         bytes.push(client_code(self.client));
         bytes.push(class_code(self.artifact_class));
         bytes.extend_from_slice(&self.segment_offset.to_le_bytes());
@@ -94,33 +91,15 @@ impl SegmentLocationRecord {
         let Some(version) = bytes.first().copied() else {
             return Ok(None);
         };
-        if version != SEGMENT_LOCATION_RECORD_VERSION_V1
-            && version != SEGMENT_LOCATION_RECORD_VERSION_V2
-            && version != SEGMENT_LOCATION_RECORD_VERSION_V3
-        {
+        if version != SEGMENT_LOCATION_RECORD_VERSION {
             return Ok(None);
         }
         let mut cursor = 1;
-        let kind = decode_kind(read_u8(bytes, &mut cursor)?)?;
-        let client = if version == SEGMENT_LOCATION_RECORD_VERSION_V3 {
-            decode_client(read_u8(bytes, &mut cursor)?)?
-        } else {
-            kind.client()
-        };
-        let artifact_class = if version == SEGMENT_LOCATION_RECORD_VERSION_V3 {
-            decode_class(read_u8(bytes, &mut cursor)?)?
-        } else {
-            kind.artifact_class()
-        };
+        let client = decode_client(read_u8(bytes, &mut cursor)?)?;
+        let artifact_class = decode_class(read_u8(bytes, &mut cursor)?)?;
         let segment_offset = read_u64(bytes, &mut cursor)?;
         let size = read_u64(bytes, &mut cursor)?;
-        let version_ms = if version == SEGMENT_LOCATION_RECORD_VERSION_V2 {
-            read_u64(bytes, &mut cursor)?
-        } else if version == SEGMENT_LOCATION_RECORD_VERSION_V3 {
-            read_u64(bytes, &mut cursor)?
-        } else {
-            0
-        };
+        let version_ms = read_u64(bytes, &mut cursor)?;
         let created_at_ms = read_u64(bytes, &mut cursor)?;
         let namespace_id = read_string(bytes, &mut cursor)?;
         let key = read_string(bytes, &mut cursor)?;
@@ -129,7 +108,6 @@ impl SegmentLocationRecord {
 
         Ok(Some(
             Self {
-                kind,
                 client,
                 artifact_class,
                 namespace_id,
@@ -138,24 +116,11 @@ impl SegmentLocationRecord {
                 segment_id,
                 segment_offset,
                 size,
-                version_ms: if version_ms == 0 {
-                    created_at_ms
-                } else {
-                    version_ms
-                },
+                version_ms,
                 created_at_ms,
             }
-            .into_manifest(artifact_id),
+            .into_manifest(artifact_id)?,
         ))
-    }
-}
-
-fn kind_code(kind: ArtifactKind) -> u8 {
-    match kind {
-        ArtifactKind::Keyvalue => 0,
-        ArtifactKind::Xcode => 1,
-        ArtifactKind::Gradle => 2,
-        ArtifactKind::Module => 3,
     }
 }
 
@@ -172,16 +137,6 @@ fn class_code(class: ArtifactClass) -> u8 {
     match class {
         ArtifactClass::Blob => 0,
         ArtifactClass::ActionCache => 1,
-    }
-}
-
-fn decode_kind(code: u8) -> Result<ArtifactKind, String> {
-    match code {
-        0 => Ok(ArtifactKind::Keyvalue),
-        1 => Ok(ArtifactKind::Xcode),
-        2 => Ok(ArtifactKind::Gradle),
-        3 => Ok(ArtifactKind::Module),
-        _ => Err(format!("invalid artifact kind code {code}")),
     }
 }
 
@@ -292,19 +247,21 @@ mod tests {
     #[test]
     fn ignores_non_record_payloads() {
         assert!(
-            SegmentLocationRecord::decode(br#"{"artifact_id":"legacy"}"#, "artifact")
-                .expect("legacy payload should not error")
+            SegmentLocationRecord::decode(br#"{"artifact_id":"not-a-record"}"#, "artifact")
+                .expect("non-record payload should not error")
                 .is_none()
         );
     }
 
     #[test]
-    fn decodes_v1_records_by_promoting_created_at_to_version() {
+    fn rejects_record_with_unsupported_dimensions() {
         let mut bytes = Vec::new();
         bytes.push(1);
-        bytes.push(2);
+        bytes.push(0);
+        bytes.push(0);
         bytes.extend_from_slice(&42_u64.to_le_bytes());
         bytes.extend_from_slice(&512_u64.to_le_bytes());
+        bytes.extend_from_slice(&1234_u64.to_le_bytes());
         bytes.extend_from_slice(&1234_u64.to_le_bytes());
         for value in [
             "android",
@@ -316,15 +273,11 @@ mod tests {
             bytes.extend_from_slice(value.as_bytes());
         }
 
-        let decoded = SegmentLocationRecord::decode(&bytes, "artifact")
-            .expect("v1 record should decode")
-            .expect("v1 record should produce a manifest");
-        assert_eq!(decoded.kind, ArtifactKind::Gradle);
-        assert_eq!(decoded.segment_id.as_deref(), Some("segment-1"));
-        assert_eq!(decoded.segment_offset, Some(42));
-        assert_eq!(decoded.version_ms, 1234);
-        assert_eq!(decoded.created_at_ms, 1234);
-        assert_eq!(decoded.client, ArtifactClient::Gradle);
-        assert_eq!(decoded.artifact_class, ArtifactClass::Blob);
+        let error = SegmentLocationRecord::decode(&bytes, "artifact")
+            .expect_err("unsupported dimensions should fail decoding");
+        assert!(
+            error.contains("unsupported artifact dimensions"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::{
     Json, Router,
@@ -15,10 +15,10 @@ use tracing::{Instrument, field};
 
 use crate::{
     artifact::{kind::ArtifactKind, manifest::ArtifactManifest},
-    constants::{MAX_GRADLE_BYTES, MAX_MODULE_PART_BYTES, MAX_XCODE_BYTES},
+    constants::{MAX_GRADLE_BYTES, MAX_MODULE_PART_BYTES, MAX_MODULE_TOTAL_BYTES, MAX_XCODE_BYTES},
+    extension::{AccessDecision, ExtensionContext},
     multipart::error::MultipartError,
-    replication::enqueue_replication_for_artifact,
-    replication::{operation::ReplicationOperation, outbox_message::OutboxMessage},
+    replication::replication_targets,
     state::SharedState,
     telemetry::attach_parent_context,
     utils::{BodyReadError, module_key, read_request_to_temp},
@@ -28,6 +28,11 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/up", get(up))
         .route("/metrics", get(metrics_handler))
+        .route("/v1/cache/{hash}", get(get_nx).put(put_nx))
+        .route(
+            "/api/metro/cache/{cache_key}",
+            get(get_metro).put(put_metro),
+        )
         .route("/api/cache/keyvalue/{cas_id}", get(get_keyvalue))
         .route("/api/cache/keyvalue", put(put_keyvalue))
         .route("/api/cache/cas/{id}", get(get_xcode).post(put_xcode))
@@ -42,6 +47,18 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/_internal/status", get(internal_status))
         .route(
+            "/_internal/bootstrap/manifests",
+            get(internal_bootstrap_manifests),
+        )
+        .route(
+            "/_internal/bootstrap/namespace_tombstones",
+            get(internal_bootstrap_namespace_tombstones),
+        )
+        .route(
+            "/_internal/bootstrap/artifacts/{artifact_id}",
+            get(internal_bootstrap_artifact),
+        )
+        .route(
             "/_internal/replicate/artifact",
             put(internal_replicate_artifact),
         )
@@ -51,10 +68,17 @@ pub fn router(state: SharedState) -> Router {
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            apply_extensions,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             track_http_metrics,
         ))
         .with_state(state)
 }
+
+const NX_NAMESPACE_ID: &str = "nx";
+const METRO_NAMESPACE_ID: &str = "metro";
 
 #[derive(Debug, PartialEq, Eq)]
 struct NamespaceQuery {
@@ -156,6 +180,37 @@ struct ReplicateArtifactQuery {
     version_ms: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PageQuery {
+    after: Option<String>,
+    limit: usize,
+}
+
+impl PageQuery {
+    fn from_params(params: &HashMap<String, String>) -> Result<Self, String> {
+        let limit = params
+            .get("limit")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|error| format!("Invalid limit: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(256);
+        if limit == 0 {
+            return Err("Invalid limit: must be greater than 0".to_string());
+        }
+
+        Ok(Self {
+            after: params
+                .get("after")
+                .cloned()
+                .filter(|value| !value.is_empty()),
+            limit,
+        })
+    }
+}
+
 impl ReplicateArtifactQuery {
     fn from_params(params: &HashMap<String, String>) -> Result<Self, String> {
         Ok(Self {
@@ -225,19 +280,325 @@ async fn track_http_metrics(
     response
 }
 
+async fn apply_extensions(State(state): State<SharedState>, req: Request, next: Next) -> Response {
+    let Some(extension) = state.extension.as_ref() else {
+        return next.run(req).await;
+    };
+
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = req.uri().path().to_owned();
+    if should_skip_extension_route(&route) {
+        return next.run(req).await;
+    }
+
+    let method = req.method().to_string();
+    let query = parse_query_map(req.uri().query());
+    let request_headers = header_map_to_btree(req.headers());
+    let context = extension_context_from_http(
+        &state,
+        &route,
+        &method,
+        &path,
+        &query,
+        &request_headers,
+        None,
+    )
+    .await;
+
+    let principal = match extension.evaluate_access(&context).await {
+        AccessDecision::Allow(principal) => principal,
+        AccessDecision::Deny(deny) => {
+            return error_response(status_from_u16(deny.status), deny.message);
+        }
+    };
+
+    let mut response = next.run(req).await;
+
+    let response_context = extension_context_from_http(
+        &state,
+        &route,
+        &method,
+        &path,
+        &query,
+        &request_headers,
+        Some(response.status().as_u16()),
+    )
+    .await;
+    let headers = extension
+        .response_headers(&response_context, principal.as_ref())
+        .await;
+    for (name, value) in headers.headers {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::header::HeaderName::try_from(name),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+
+    response
+}
+
+fn should_skip_extension_route(route: &str) -> bool {
+    route == "/up" || route == "/metrics" || route.starts_with("/_internal/")
+}
+
+async fn extension_context_from_http(
+    state: &SharedState,
+    route: &str,
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    headers: &BTreeMap<String, String>,
+    status_code: Option<u16>,
+) -> ExtensionContext {
+    let metadata = http_extension_metadata(state, route, method, path, query).await;
+    ExtensionContext {
+        transport: "http".into(),
+        route: route.to_owned(),
+        method: method.to_owned(),
+        operation: metadata.operation,
+        tenant_id: metadata.tenant_id,
+        namespace_id: metadata.namespace_id,
+        client: metadata.client,
+        artifact_class: metadata.artifact_class,
+        artifact_key: metadata.artifact_key,
+        artifact_hash: metadata.artifact_hash,
+        headers: headers.clone(),
+        query: query
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        status_code,
+    }
+}
+
+struct HttpExtensionMetadata {
+    operation: String,
+    tenant_id: Option<String>,
+    namespace_id: Option<String>,
+    client: Option<String>,
+    artifact_class: Option<String>,
+    artifact_key: Option<String>,
+    artifact_hash: Option<String>,
+}
+
+async fn http_extension_metadata(
+    state: &SharedState,
+    route: &str,
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+) -> HttpExtensionMetadata {
+    let tenant_id = query.get("tenant_id").cloned();
+    let mut namespace_id = query.get("namespace_id").cloned();
+    let last_path_segment = path.rsplit('/').next().map(str::to_owned);
+
+    match route {
+        "/api/cache/keyvalue/{cas_id}" => HttpExtensionMetadata {
+            operation: "artifact.read".into(),
+            tenant_id,
+            namespace_id,
+            client: Some("generic".into()),
+            artifact_class: Some("action_cache".into()),
+            artifact_key: last_path_segment,
+            artifact_hash: None,
+        },
+        "/api/cache/keyvalue" => HttpExtensionMetadata {
+            operation: "artifact.write".into(),
+            tenant_id,
+            namespace_id,
+            client: Some("generic".into()),
+            artifact_class: Some("action_cache".into()),
+            artifact_key: query.get("cas_id").cloned(),
+            artifact_hash: None,
+        },
+        "/api/cache/cas/{id}" => HttpExtensionMetadata {
+            operation: if method.eq_ignore_ascii_case("GET") {
+                "artifact.read"
+            } else {
+                "artifact.write"
+            }
+            .into(),
+            tenant_id,
+            namespace_id,
+            client: Some("xcode".into()),
+            artifact_class: Some("blob".into()),
+            artifact_key: last_path_segment.clone(),
+            artifact_hash: last_path_segment.clone(),
+        },
+        "/api/cache/gradle/{cache_key}" => HttpExtensionMetadata {
+            operation: if method.eq_ignore_ascii_case("GET") {
+                "artifact.read"
+            } else {
+                "artifact.write"
+            }
+            .into(),
+            tenant_id,
+            namespace_id,
+            client: Some("gradle".into()),
+            artifact_class: Some("blob".into()),
+            artifact_key: last_path_segment.clone(),
+            artifact_hash: last_path_segment.clone(),
+        },
+        "/api/cache/module/{id}" => HttpExtensionMetadata {
+            operation: if method.eq_ignore_ascii_case("HEAD") || method.eq_ignore_ascii_case("GET")
+            {
+                "artifact.read"
+            } else {
+                "artifact.write"
+            }
+            .into(),
+            tenant_id,
+            namespace_id,
+            client: Some("module".into()),
+            artifact_class: Some("blob".into()),
+            artifact_key: Some(module_key_from_query(query)),
+            artifact_hash: query.get("hash").cloned(),
+        },
+        "/api/cache/module/start" | "/api/cache/module/part" | "/api/cache/module/complete" => {
+            let multipart_upload = query
+                .get("upload_id")
+                .and_then(|upload_id| state.store.multipart_upload(upload_id).ok().flatten());
+            let tenant_id =
+                tenant_id.or_else(|| multipart_upload.as_ref().map(|u| u.tenant_id.clone()));
+            let namespace_id =
+                namespace_id.or_else(|| multipart_upload.as_ref().map(|u| u.namespace_id.clone()));
+            let artifact_key = multipart_upload
+                .as_ref()
+                .map(|upload| module_key(&upload.category, &upload.hash, &upload.name))
+                .or_else(|| Some(module_key_from_query(query)));
+            let artifact_hash = query
+                .get("hash")
+                .cloned()
+                .or_else(|| multipart_upload.map(|u| u.hash));
+
+            HttpExtensionMetadata {
+                operation: "artifact.write".into(),
+                tenant_id,
+                namespace_id,
+                client: Some("module".into()),
+                artifact_class: Some("blob".into()),
+                artifact_key,
+                artifact_hash,
+            }
+        }
+        "/api/cache/clean" => HttpExtensionMetadata {
+            operation: "namespace.delete".into(),
+            tenant_id,
+            namespace_id,
+            client: None,
+            artifact_class: None,
+            artifact_key: None,
+            artifact_hash: None,
+        },
+        "/v1/cache/{hash}" => {
+            namespace_id = Some(NX_NAMESPACE_ID.into());
+            HttpExtensionMetadata {
+                operation: if method.eq_ignore_ascii_case("GET") {
+                    "artifact.read"
+                } else {
+                    "artifact.write"
+                }
+                .into(),
+                tenant_id: Some("default".into()),
+                namespace_id,
+                client: Some("nx".into()),
+                artifact_class: Some("blob".into()),
+                artifact_key: last_path_segment.clone(),
+                artifact_hash: last_path_segment,
+            }
+        }
+        "/api/metro/cache/{cache_key}" => {
+            namespace_id = Some(METRO_NAMESPACE_ID.into());
+            HttpExtensionMetadata {
+                operation: if method.eq_ignore_ascii_case("GET") {
+                    "artifact.read"
+                } else {
+                    "artifact.write"
+                }
+                .into(),
+                tenant_id: Some("default".into()),
+                namespace_id,
+                client: Some("metro".into()),
+                artifact_class: Some("blob".into()),
+                artifact_key: last_path_segment.clone(),
+                artifact_hash: last_path_segment,
+            }
+        }
+        _ => HttpExtensionMetadata {
+            operation: "request".into(),
+            tenant_id,
+            namespace_id,
+            client: None,
+            artifact_class: None,
+            artifact_key: None,
+            artifact_hash: None,
+        },
+    }
+}
+
+fn module_key_from_query(query: &HashMap<String, String>) -> String {
+    let category = query
+        .get("cache_category")
+        .cloned()
+        .unwrap_or_else(|| "builds".into());
+    let hash = query.get("hash").cloned().unwrap_or_default();
+    let name = query.get("name").cloned().unwrap_or_default();
+    module_key(&category, &hash, &name)
+}
+
+fn parse_query_map(query: Option<&str>) -> HashMap<String, String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect()
+}
+
+fn header_map_to_btree(headers: &axum::http::HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
+}
+
+fn status_from_u16(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn up(State(state): State<SharedState>) -> impl IntoResponse {
     let members = state.members.read().await.clone();
+    let peer_nodes = state.peer_nodes.read().await.clone();
     let mut all_members = members;
     all_members.insert(state.config.region.clone());
+    let mut nodes = peer_nodes.keys().cloned().collect::<Vec<_>>();
+    nodes.push(state.config.node_url.clone());
+    nodes.sort();
 
     Json(serde_json::json!({
         "status": "ok",
         "tenant_id": state.config.tenant_id.clone(),
         "region": state.config.region.clone(),
         "node": state.config.region.clone(),
-        "connected_nodes": all_members.iter().cloned().filter(|region| region != &state.config.region).collect::<Vec<_>>(),
-        "ring_members": all_members.len(),
+        "node_url": state.config.node_url.clone(),
+        "connected_nodes": peer_nodes.keys().cloned().collect::<Vec<_>>(),
+        "ring_members": peer_nodes.len() + 1,
         "members": all_members.into_iter().collect::<Vec<_>>(),
+        "nodes": nodes,
     }))
 }
 
@@ -266,6 +627,51 @@ async fn get_keyvalue(
         ArtifactKind::Keyvalue,
         &namespace.namespace_id,
         &cas_id,
+    )
+    .await
+}
+
+async fn get_nx(AxumPath(hash): AxumPath<String>, State(state): State<SharedState>) -> Response {
+    get_artifact(state, ArtifactKind::Module, NX_NAMESPACE_ID, &hash).await
+}
+
+async fn put_nx(
+    AxumPath(hash): AxumPath<String>,
+    State(state): State<SharedState>,
+    request: Request,
+) -> Response {
+    put_blob_artifact(
+        state,
+        ArtifactKind::Module,
+        NX_NAMESPACE_ID,
+        &hash,
+        request,
+        MAX_MODULE_TOTAL_BYTES,
+        StatusCode::OK,
+    )
+    .await
+}
+
+async fn get_metro(
+    AxumPath(cache_key): AxumPath<String>,
+    State(state): State<SharedState>,
+) -> Response {
+    get_artifact(state, ArtifactKind::Module, METRO_NAMESPACE_ID, &cache_key).await
+}
+
+async fn put_metro(
+    AxumPath(cache_key): AxumPath<String>,
+    State(state): State<SharedState>,
+    request: Request,
+) -> Response {
+    put_blob_artifact(
+        state,
+        ArtifactKind::Module,
+        METRO_NAMESPACE_ID,
+        &cache_key,
+        request,
+        MAX_MODULE_TOTAL_BYTES,
+        StatusCode::OK,
     )
     .await
 }
@@ -316,20 +722,22 @@ async fn put_keyvalue(
             );
         }
     };
+    let targets = replication_targets(&state).await;
 
     match state
         .store
-        .persist_artifact_from_bytes(
+        .persist_artifact_from_bytes_and_enqueue(
             ArtifactKind::Keyvalue,
             &namespace.namespace_id,
             &cas_id,
             "application/json",
             &payload_bytes,
+            &targets,
         )
         .await
     {
         Ok(manifest) => {
-            enqueue_replication_for_artifact(&state, &manifest);
+            state.notify.notify_one();
             state
                 .metrics
                 .record_artifact_write(ArtifactKind::Keyvalue, "ok", manifest.size);
@@ -589,13 +997,14 @@ async fn complete_module_upload(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
+    let targets = replication_targets(&state).await;
     match state
         .store
-        .complete_multipart_upload(&query.upload_id, &body.parts)
+        .complete_multipart_upload_and_enqueue(&query.upload_id, &body.parts, &targets)
         .await
     {
         Ok(manifest) => {
-            enqueue_replication_for_artifact(&state, &manifest);
+            state.notify.notify_one();
             state
                 .metrics
                 .record_artifact_write(ArtifactKind::Module, "ok", manifest.size);
@@ -625,24 +1034,13 @@ async fn clean_namespace(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.store.delete_namespace(&namespace.namespace_id).await {
-        Ok(version_ms) => {
-            for peer in state
-                .config
-                .peers
-                .iter()
-                .filter(|peer| *peer != &state.config.node_url)
-            {
-                if let Err(error) = state.store.enqueue(OutboxMessage {
-                    target: peer.clone(),
-                    operation: ReplicationOperation::DeleteNamespace {
-                        namespace_id: namespace.namespace_id.clone(),
-                        version_ms,
-                    },
-                }) {
-                    tracing::warn!("failed to enqueue namespace delete for {peer}: {error}");
-                }
-            }
+    let targets = replication_targets(&state).await;
+    match state
+        .store
+        .delete_namespace_and_enqueue(&namespace.namespace_id, &targets)
+        .await
+    {
+        Ok(_version_ms) => {
             state.notify.notify_one();
             StatusCode::NO_CONTENT.into_response()
         }
@@ -657,7 +1055,64 @@ async fn internal_status(State(state): State<SharedState>) -> impl IntoResponse 
     Json(serde_json::json!({
         "region": state.config.region.clone(),
         "tenant_id": state.config.tenant_id.clone(),
+        "node_url": state.config.node_url.clone(),
     }))
+}
+
+async fn internal_bootstrap_manifests(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<SharedState>,
+) -> Response {
+    let query = match PageQuery::from_params(&params) {
+        Ok(query) => query,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+
+    match state
+        .store
+        .manifests_page(query.after.as_deref(), query.limit)
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list bootstrap manifests: {error}"),
+        ),
+    }
+}
+
+async fn internal_bootstrap_namespace_tombstones(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<SharedState>,
+) -> Response {
+    let query = match PageQuery::from_params(&params) {
+        Ok(query) => query,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+
+    match state
+        .store
+        .namespace_tombstones_page(query.after.as_deref(), query.limit)
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list bootstrap tombstones: {error}"),
+        ),
+    }
+}
+
+async fn internal_bootstrap_artifact(
+    AxumPath(artifact_id): AxumPath<String>,
+    State(state): State<SharedState>,
+) -> Response {
+    match state.store.manifest(&artifact_id) {
+        Ok(Some(manifest)) => serve_file(&state, StatusCode::OK, &manifest).await,
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load bootstrap artifact: {error}"),
+        ),
+    }
 }
 
 async fn internal_replicate_artifact(
@@ -865,19 +1320,21 @@ async fn put_blob_artifact(
         }
     };
 
+    let targets = replication_targets(&state).await;
     match state
         .store
-        .persist_artifact_from_path(
+        .persist_artifact_from_path_and_enqueue(
             kind,
             namespace_id,
             key,
             "application/octet-stream",
             &temp.path,
+            &targets,
         )
         .await
     {
         Ok(manifest) => {
-            enqueue_replication_for_artifact(&state, &manifest);
+            state.notify.notify_one();
             state
                 .metrics
                 .record_artifact_write(kind, "ok", manifest.size);
@@ -938,6 +1395,12 @@ mod tests {
         })
         .await;
         context.state.members.write().await.insert("eu-west".into());
+        context
+            .state
+            .peer_nodes
+            .write()
+            .await
+            .insert("http://peer.kura.internal:4000".into(), "eu-west".into());
 
         let response = router(context.state.clone())
             .oneshot(
@@ -955,6 +1418,11 @@ mod tests {
         assert_eq!(body["ring_members"], 2);
         assert_eq!(body["region"], "us-east");
         assert!(body["members"].to_string().contains("eu-west"));
+        assert!(
+            body["connected_nodes"]
+                .to_string()
+                .contains("http://peer.kura.internal:4000")
+        );
     }
 
     #[tokio::test]
@@ -1080,6 +1548,37 @@ mod tests {
             .expect("get request failed");
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(response_text(get).await, "part-one-part-two");
+    }
+
+    #[tokio::test]
+    async fn extension_context_resolves_namespace_from_multipart_upload() {
+        let context = test_context(|_| {}).await;
+        let upload_id = context
+            .state
+            .store
+            .start_multipart_upload("acme", "ios", "builds", "hash-1", "Module.framework")
+            .expect("failed to start multipart upload");
+        let query = parse_query_map(Some(&format!("upload_id={upload_id}&part_number=1")));
+        let headers = BTreeMap::new();
+
+        let extension_context = extension_context_from_http(
+            &context.state,
+            "/api/cache/module/part",
+            "POST",
+            "/api/cache/module/part",
+            &query,
+            &headers,
+            None,
+        )
+        .await;
+
+        assert_eq!(extension_context.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(extension_context.namespace_id.as_deref(), Some("ios"));
+        assert_eq!(extension_context.artifact_hash.as_deref(), Some("hash-1"));
+        assert_eq!(
+            extension_context.artifact_key.as_deref(),
+            Some("builds/hash-1/Module.framework")
+        );
     }
 
     #[tokio::test]
