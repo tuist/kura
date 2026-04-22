@@ -42,6 +42,13 @@ const KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "KURA_OTEL_EXPORTER_OTLP_T
 const KURA_OTEL_SERVICE_NAME: &str = "KURA_OTEL_SERVICE_NAME";
 const KURA_OTEL_DEPLOYMENT_ENVIRONMENT: &str = "KURA_OTEL_DEPLOYMENT_ENVIRONMENT";
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const DEFAULT_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_MAX_KEYVALUE_BYTES: usize = 1024 * 1024;
+const FALLBACK_HOST_FD_LIMIT: usize = 4096;
+const FALLBACK_HOST_MEMORY_LIMIT_BYTES: u64 = 1024 * BYTES_PER_MIB;
+const FALLBACK_HOST_CPU_COUNT: usize = 4;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
@@ -93,17 +100,123 @@ pub struct AnalyticsConfig {
     pub circuit_breaker_open_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostResources {
+    pub file_descriptor_limit: usize,
+    pub memory_limit_bytes: u64,
+    pub cpu_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DerivedRuntimeDefaults {
+    file_descriptor_pool_size: usize,
+    file_descriptor_acquire_timeout_ms: u64,
+    segment_handle_cache_size: usize,
+    memory_soft_limit_bytes: u64,
+    memory_hard_limit_bytes: u64,
+    manifest_cache_max_bytes: usize,
+    max_keyvalue_bytes: usize,
+    metadata_store_max_open_files: i32,
+    metadata_store_max_background_jobs: i32,
+    metadata_store_read_cache_bytes: usize,
+    metadata_store_write_buffer_pool_bytes: usize,
+    metadata_store_write_buffer_bytes: usize,
+    metadata_store_max_write_buffers: i32,
+}
+
+impl HostResources {
+    fn detect() -> Self {
+        Self {
+            file_descriptor_limit: detect_file_descriptor_limit()
+                .unwrap_or(FALLBACK_HOST_FD_LIMIT)
+                .max(256),
+            memory_limit_bytes: detect_memory_limit_bytes()
+                .unwrap_or(FALLBACK_HOST_MEMORY_LIMIT_BYTES)
+                .max(256 * BYTES_PER_MIB),
+            cpu_count: detect_cpu_count().max(1),
+        }
+    }
+}
+
+impl DerivedRuntimeDefaults {
+    fn from_host_resources(host_resources: HostResources) -> Self {
+        let reserved_fds = host_resources.file_descriptor_limit.max(64) / 8;
+        let usable_fds = host_resources
+            .file_descriptor_limit
+            .saturating_sub(reserved_fds.max(64))
+            .max(256);
+        let file_descriptor_pool_size = clamp_usize(usable_fds / 8, 64, 256);
+        let segment_handle_cache_size = clamp_usize(file_descriptor_pool_size / 4, 16, 64)
+            .min(file_descriptor_pool_size.saturating_sub(1).max(1));
+        let metadata_store_max_open_files =
+            clamp_usize(usable_fds / 2, 128, 1024).min(i32::MAX as usize) as i32;
+
+        let memory_limit_bytes = host_resources.memory_limit_bytes.max(256 * BYTES_PER_MIB);
+        let memory_soft_limit_bytes =
+            round_down_to_mib(memory_limit_bytes * 70 / 100).max(128 * BYTES_PER_MIB);
+        let memory_hard_limit_bytes = round_down_to_mib(
+            (memory_limit_bytes * 85 / 100).max(memory_soft_limit_bytes + 64 * BYTES_PER_MIB),
+        );
+        let manifest_cache_max_bytes = clamp_bytes_to_usize(
+            round_down_to_mib(memory_soft_limit_bytes / 16),
+            8 * BYTES_PER_MIB,
+            64 * BYTES_PER_MIB,
+        );
+        let metadata_store_read_cache_bytes = clamp_bytes_to_usize(
+            round_down_to_mib(memory_limit_bytes / 32),
+            16 * BYTES_PER_MIB,
+            128 * BYTES_PER_MIB,
+        );
+        let metadata_store_write_buffer_pool_bytes = clamp_bytes_to_usize(
+            round_down_to_mib(memory_limit_bytes / 32),
+            16 * BYTES_PER_MIB,
+            128 * BYTES_PER_MIB,
+        );
+        let metadata_store_write_buffer_bytes = clamp_bytes_to_usize(
+            round_down_to_mib((metadata_store_write_buffer_pool_bytes as u64) / 4),
+            4 * BYTES_PER_MIB,
+            32 * BYTES_PER_MIB,
+        )
+        .min(metadata_store_write_buffer_pool_bytes);
+        let metadata_store_max_write_buffers = clamp_usize(
+            metadata_store_write_buffer_pool_bytes / metadata_store_write_buffer_bytes.max(1),
+            2,
+            8,
+        ) as i32;
+
+        Self {
+            file_descriptor_pool_size,
+            file_descriptor_acquire_timeout_ms: DEFAULT_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS,
+            segment_handle_cache_size,
+            memory_soft_limit_bytes,
+            memory_hard_limit_bytes,
+            manifest_cache_max_bytes,
+            max_keyvalue_bytes: DEFAULT_MAX_KEYVALUE_BYTES,
+            metadata_store_max_open_files,
+            metadata_store_max_background_jobs: clamp_usize(host_resources.cpu_count, 1, 8) as i32,
+            metadata_store_read_cache_bytes,
+            metadata_store_write_buffer_pool_bytes,
+            metadata_store_write_buffer_bytes,
+            metadata_store_max_write_buffers,
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        Self::from_lookup_with_resources(|key| std::env::var(key).ok(), HostResources::detect())
     }
 
-    pub(crate) fn from_lookup<F>(mut lookup: F) -> Result<Self, String>
+    pub(crate) fn from_lookup_with_resources<F>(
+        mut lookup: F,
+        host_resources: HostResources,
+    ) -> Result<Self, String>
     where
         F: FnMut(&str) -> Option<String>,
     {
         let mut missing = Vec::new();
         let mut invalid = Vec::new();
+        let derived_defaults = DerivedRuntimeDefaults::from_host_resources(host_resources);
 
         let port =
             required_value(&mut lookup, KURA_PORT, &mut missing).and_then(|value| {
@@ -130,15 +243,16 @@ impl Config {
         let tmp_dir = required_value(&mut lookup, KURA_TMP_DIR, &mut missing).map(PathBuf::from);
         let data_dir = required_value(&mut lookup, KURA_DATA_DIR, &mut missing).map(PathBuf::from);
         let node_url = required_value(&mut lookup, KURA_NODE_URL, &mut missing);
-        let peers: Option<Vec<String>> =
-            required_value(&mut lookup, KURA_PEERS, &mut missing).map(|value| {
+        let peers = lookup(KURA_PEERS)
+            .map(|value| {
                 value
                     .split(',')
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(ToOwned::to_owned)
                     .collect()
-            });
+            })
+            .or_else(|| node_url.as_ref().map(|value| vec![value.clone()]));
         let discovery_dns_name = lookup(KURA_DISCOVERY_DNS_NAME)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
@@ -179,202 +293,165 @@ impl Config {
                 None
             }
         };
-        let file_descriptor_pool_size =
-            required_value(&mut lookup, KURA_FILE_DESCRIPTOR_POOL_SIZE, &mut missing).and_then(
-                |value| match value.parse::<usize>() {
-                    Ok(pool_size) if pool_size > 0 => Some(pool_size),
-                    Ok(_) => {
-                        invalid.push(format!(
-                            "{KURA_FILE_DESCRIPTOR_POOL_SIZE} must be greater than 0"
-                        ));
-                        None
-                    }
-                    Err(_) => {
-                        invalid.push(format!(
-                            "{KURA_FILE_DESCRIPTOR_POOL_SIZE} must be a valid usize"
-                        ));
-                        None
-                    }
-                },
-            );
-        let file_descriptor_acquire_timeout_ms = required_value(
+        let file_descriptor_pool_size = optional_parsed_value(
+            &mut lookup,
+            KURA_FILE_DESCRIPTOR_POOL_SIZE,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_FILE_DESCRIPTOR_POOL_SIZE} must be a valid usize"))
+            },
+        )
+        .unwrap_or(derived_defaults.file_descriptor_pool_size);
+        if file_descriptor_pool_size == 0 {
+            invalid.push(format!(
+                "{KURA_FILE_DESCRIPTOR_POOL_SIZE} must be greater than 0"
+            ));
+        }
+        let file_descriptor_acquire_timeout_ms = optional_parsed_value(
             &mut lookup,
             KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS,
-            &mut missing,
+            &mut invalid,
+            |value| {
+                value.parse::<u64>().map_err(|_| {
+                    format!("{KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS} must be a valid u64")
+                })
+            },
         )
-        .and_then(|value| match value.parse::<u64>() {
-            Ok(timeout_ms) if timeout_ms > 0 => Some(timeout_ms),
-            Ok(_) => {
-                invalid.push(format!(
-                    "{KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS} must be greater than 0"
-                ));
-                None
-            }
-            Err(_) => {
-                invalid.push(format!(
-                    "{KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS} must be a valid u64"
-                ));
-                None
-            }
+        .unwrap_or(derived_defaults.file_descriptor_acquire_timeout_ms);
+        if file_descriptor_acquire_timeout_ms == 0 {
+            invalid.push(format!(
+                "{KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS} must be greater than 0"
+            ));
+        }
+        let segment_handle_cache_size = optional_parsed_value(
+            &mut lookup,
+            KURA_SEGMENT_HANDLE_CACHE_SIZE,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_SEGMENT_HANDLE_CACHE_SIZE} must be a valid usize"))
+            },
+        )
+        .unwrap_or_else(|| {
+            derived_defaults
+                .segment_handle_cache_size
+                .min(file_descriptor_pool_size.saturating_sub(1).max(1))
         });
-        let segment_handle_cache_size =
-            required_value(&mut lookup, KURA_SEGMENT_HANDLE_CACHE_SIZE, &mut missing).and_then(
-                |value| match value.parse::<usize>() {
-                    Ok(cache_size) => {
-                        if let Some(pool_size) = file_descriptor_pool_size {
-                            if cache_size >= pool_size {
-                                invalid.push(format!(
-                                    "{KURA_SEGMENT_HANDLE_CACHE_SIZE} must be less than {KURA_FILE_DESCRIPTOR_POOL_SIZE} so transient file operations keep headroom"
-                                ));
-                                None
-                            } else {
-                                Some(cache_size)
-                            }
-                        } else {
-                            Some(cache_size)
-                        }
-                    }
-                    Err(_) => {
-                        invalid.push(format!(
-                            "{KURA_SEGMENT_HANDLE_CACHE_SIZE} must be a valid usize"
-                        ));
-                        None
-                    }
-                },
-            );
-        let memory_soft_limit_bytes =
-            required_value(&mut lookup, KURA_MEMORY_SOFT_LIMIT_BYTES, &mut missing).and_then(
-                |value| match value.parse::<u64>() {
-                    Ok(limit) if limit > 0 => Some(limit),
-                    Ok(_) => {
-                        invalid.push(format!(
-                            "{KURA_MEMORY_SOFT_LIMIT_BYTES} must be greater than 0"
-                        ));
-                        None
-                    }
-                    Err(_) => {
-                        invalid.push(format!(
-                            "{KURA_MEMORY_SOFT_LIMIT_BYTES} must be a valid u64"
-                        ));
-                        None
-                    }
-                },
-            );
-        let memory_hard_limit_bytes =
-            required_value(&mut lookup, KURA_MEMORY_HARD_LIMIT_BYTES, &mut missing).and_then(
-                |value| match value.parse::<u64>() {
-                    Ok(limit) => {
-                        if let Some(soft_limit) = memory_soft_limit_bytes {
-                            if limit <= soft_limit {
-                                invalid.push(format!(
-                                    "{KURA_MEMORY_HARD_LIMIT_BYTES} must be greater than {KURA_MEMORY_SOFT_LIMIT_BYTES}"
-                                ));
-                                None
-                            } else {
-                                Some(limit)
-                            }
-                        } else if limit > 0 {
-                            Some(limit)
-                        } else {
-                            invalid.push(format!(
-                                "{KURA_MEMORY_HARD_LIMIT_BYTES} must be greater than 0"
-                            ));
-                            None
-                        }
-                    }
-                    Err(_) => {
-                        invalid.push(format!(
-                            "{KURA_MEMORY_HARD_LIMIT_BYTES} must be a valid u64"
-                        ));
-                        None
-                    }
-                },
-            );
-        let manifest_cache_max_bytes =
-            required_value(&mut lookup, KURA_MANIFEST_CACHE_MAX_BYTES, &mut missing).and_then(
-                |value| match value.parse::<usize>() {
-                    Ok(limit) if limit > 0 => {
-                        if let Some(soft_limit) = memory_soft_limit_bytes {
-                            if limit as u64 >= soft_limit {
-                                invalid.push(format!(
-                                    "{KURA_MANIFEST_CACHE_MAX_BYTES} must be less than {KURA_MEMORY_SOFT_LIMIT_BYTES} so the cache leaves heap headroom"
-                                ));
-                                None
-                            } else {
-                                Some(limit)
-                            }
-                        } else {
-                            Some(limit)
-                        }
-                    }
-                    Ok(_) => {
-                        invalid.push(format!(
-                            "{KURA_MANIFEST_CACHE_MAX_BYTES} must be greater than 0"
-                        ));
-                        None
-                    }
-                    Err(_) => {
-                        invalid.push(format!(
-                            "{KURA_MANIFEST_CACHE_MAX_BYTES} must be a valid usize"
-                        ));
-                        None
-                    }
-                },
-            );
-        let max_keyvalue_bytes = required_value(&mut lookup, KURA_MAX_KEYVALUE_BYTES, &mut missing)
-            .and_then(|value| match value.parse::<usize>() {
-                Ok(limit) if limit > 0 => Some(limit),
-                Ok(_) => {
-                    invalid.push(format!("{KURA_MAX_KEYVALUE_BYTES} must be greater than 0"));
-                    None
-                }
-                Err(_) => {
-                    invalid.push(format!("{KURA_MAX_KEYVALUE_BYTES} must be a valid usize"));
-                    None
-                }
-            });
-        let rocksdb_max_open_files = required_value(
+        if segment_handle_cache_size >= file_descriptor_pool_size {
+            invalid.push(format!(
+                "{KURA_SEGMENT_HANDLE_CACHE_SIZE} must be less than {KURA_FILE_DESCRIPTOR_POOL_SIZE} so transient file operations keep headroom"
+            ));
+        }
+        let memory_soft_limit_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_MEMORY_SOFT_LIMIT_BYTES,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("{KURA_MEMORY_SOFT_LIMIT_BYTES} must be a valid u64"))
+            },
+        )
+        .unwrap_or(derived_defaults.memory_soft_limit_bytes);
+        if memory_soft_limit_bytes == 0 {
+            invalid.push(format!(
+                "{KURA_MEMORY_SOFT_LIMIT_BYTES} must be greater than 0"
+            ));
+        }
+        let memory_hard_limit_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_MEMORY_HARD_LIMIT_BYTES,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("{KURA_MEMORY_HARD_LIMIT_BYTES} must be a valid u64"))
+            },
+        )
+        .unwrap_or_else(|| {
+            derived_defaults
+                .memory_hard_limit_bytes
+                .max(memory_soft_limit_bytes.saturating_add(64 * BYTES_PER_MIB))
+        });
+        if memory_hard_limit_bytes <= memory_soft_limit_bytes {
+            invalid.push(format!(
+                "{KURA_MEMORY_HARD_LIMIT_BYTES} must be greater than {KURA_MEMORY_SOFT_LIMIT_BYTES}"
+            ));
+        }
+        let manifest_cache_default = clamp_usize(
+            round_down_to_mib(memory_soft_limit_bytes / 16) as usize,
+            (8 * BYTES_PER_MIB) as usize,
+            (64 * BYTES_PER_MIB) as usize,
+        );
+        let manifest_cache_max_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_MANIFEST_CACHE_MAX_BYTES,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_MANIFEST_CACHE_MAX_BYTES} must be a valid usize"))
+            },
+        )
+        .unwrap_or(manifest_cache_default);
+        if manifest_cache_max_bytes == 0 {
+            invalid.push(format!(
+                "{KURA_MANIFEST_CACHE_MAX_BYTES} must be greater than 0"
+            ));
+        } else if manifest_cache_max_bytes as u64 >= memory_soft_limit_bytes {
+            invalid.push(format!(
+                "{KURA_MANIFEST_CACHE_MAX_BYTES} must be less than {KURA_MEMORY_SOFT_LIMIT_BYTES} so the cache leaves heap headroom"
+            ));
+        }
+        let max_keyvalue_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_MAX_KEYVALUE_BYTES,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_MAX_KEYVALUE_BYTES} must be a valid usize"))
+            },
+        )
+        .unwrap_or(derived_defaults.max_keyvalue_bytes);
+        if max_keyvalue_bytes == 0 {
+            invalid.push(format!("{KURA_MAX_KEYVALUE_BYTES} must be greater than 0"));
+        }
+        let rocksdb_max_open_files = optional_parsed_value(
             &mut lookup,
             KURA_METADATA_STORE_MAX_OPEN_FILES,
-            &mut missing,
+            &mut invalid,
+            |value| {
+                value.parse::<i32>().map_err(|_| {
+                    format!("{KURA_METADATA_STORE_MAX_OPEN_FILES} must be a valid i32")
+                })
+            },
         )
-        .and_then(|value| match value.parse::<i32>() {
-            Ok(max_open_files) if max_open_files > 0 || max_open_files == -1 => {
-                Some(max_open_files)
-            }
-            Ok(_) => {
-                invalid.push(format!(
-                    "{KURA_METADATA_STORE_MAX_OPEN_FILES} must be -1 or greater than 0"
-                ));
-                None
-            }
-            Err(_) => {
-                invalid.push(format!(
-                    "{KURA_METADATA_STORE_MAX_OPEN_FILES} must be a valid i32"
-                ));
-                None
-            }
-        });
-        let rocksdb_max_background_jobs = required_value(
+        .unwrap_or(derived_defaults.metadata_store_max_open_files);
+        if !(rocksdb_max_open_files > 0 || rocksdb_max_open_files == -1) {
+            invalid.push(format!(
+                "{KURA_METADATA_STORE_MAX_OPEN_FILES} must be -1 or greater than 0"
+            ));
+        }
+        let rocksdb_max_background_jobs = optional_parsed_value(
             &mut lookup,
             KURA_METADATA_STORE_MAX_BACKGROUND_JOBS,
-            &mut missing,
+            &mut invalid,
+            |value| {
+                value.parse::<i32>().map_err(|_| {
+                    format!("{KURA_METADATA_STORE_MAX_BACKGROUND_JOBS} must be a valid i32")
+                })
+            },
         )
-        .and_then(|value| match value.parse::<i32>() {
-            Ok(max_background_jobs) if max_background_jobs > 0 => Some(max_background_jobs),
-            Ok(_) => {
-                invalid.push(format!(
-                    "{KURA_METADATA_STORE_MAX_BACKGROUND_JOBS} must be greater than 0"
-                ));
-                None
-            }
-            Err(_) => {
-                invalid.push(format!(
-                    "{KURA_METADATA_STORE_MAX_BACKGROUND_JOBS} must be a valid i32"
-                ));
-                None
-            }
-        });
+        .unwrap_or(derived_defaults.metadata_store_max_background_jobs);
+        if rocksdb_max_background_jobs <= 0 {
+            invalid.push(format!(
+                "{KURA_METADATA_STORE_MAX_BACKGROUND_JOBS} must be greater than 0"
+            ));
+        }
         let rocksdb_block_cache_bytes = optional_parsed_value(
             &mut lookup,
             KURA_METADATA_STORE_READ_CACHE_BYTES,
@@ -385,7 +462,7 @@ impl Config {
                 })
             },
         )
-        .unwrap_or(64 * 1024 * 1024);
+        .unwrap_or(derived_defaults.metadata_store_read_cache_bytes);
         if rocksdb_block_cache_bytes == 0 {
             invalid.push(format!(
                 "{KURA_METADATA_STORE_READ_CACHE_BYTES} must be greater than 0"
@@ -401,7 +478,7 @@ impl Config {
                 })
             },
         )
-        .unwrap_or(64 * 1024 * 1024);
+        .unwrap_or(derived_defaults.metadata_store_write_buffer_pool_bytes);
         if rocksdb_write_buffer_manager_bytes == 0 {
             invalid.push(format!(
                 "{KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES} must be greater than 0"
@@ -417,7 +494,7 @@ impl Config {
                 })
             },
         )
-        .unwrap_or(16 * 1024 * 1024);
+        .unwrap_or(derived_defaults.metadata_store_write_buffer_bytes);
         if rocksdb_write_buffer_size_bytes == 0 {
             invalid.push(format!(
                 "{KURA_METADATA_STORE_WRITE_BUFFER_BYTES} must be greater than 0"
@@ -437,7 +514,7 @@ impl Config {
                 })
             },
         )
-        .unwrap_or(4);
+        .unwrap_or(derived_defaults.metadata_store_max_write_buffers);
         if rocksdb_max_write_buffer_number <= 0 {
             invalid.push(format!(
                 "{KURA_METADATA_STORE_MAX_WRITE_BUFFERS} must be greater than 0"
@@ -646,26 +723,15 @@ impl Config {
             peers: peers.expect("peers should be present when configuration is valid"),
             discovery_dns_name,
             peer_tls,
-            file_descriptor_pool_size: file_descriptor_pool_size
-                .expect("file_descriptor_pool_size should be present when configuration is valid"),
-            file_descriptor_acquire_timeout_ms: file_descriptor_acquire_timeout_ms.expect(
-                "file_descriptor_acquire_timeout_ms should be present when configuration is valid",
-            ),
-            segment_handle_cache_size: segment_handle_cache_size
-                .expect("segment_handle_cache_size should be present when configuration is valid"),
-            memory_soft_limit_bytes: memory_soft_limit_bytes
-                .expect("memory_soft_limit_bytes should be present when configuration is valid"),
-            memory_hard_limit_bytes: memory_hard_limit_bytes
-                .expect("memory_hard_limit_bytes should be present when configuration is valid"),
-            manifest_cache_max_bytes: manifest_cache_max_bytes
-                .expect("manifest_cache_max_bytes should be present when configuration is valid"),
-            max_keyvalue_bytes: max_keyvalue_bytes
-                .expect("max_keyvalue_bytes should be present when configuration is valid"),
-            rocksdb_max_open_files: rocksdb_max_open_files
-                .expect("rocksdb_max_open_files should be present when configuration is valid"),
-            rocksdb_max_background_jobs: rocksdb_max_background_jobs.expect(
-                "rocksdb_max_background_jobs should be present when configuration is valid",
-            ),
+            file_descriptor_pool_size,
+            file_descriptor_acquire_timeout_ms,
+            segment_handle_cache_size,
+            memory_soft_limit_bytes,
+            memory_hard_limit_bytes,
+            manifest_cache_max_bytes,
+            max_keyvalue_bytes,
+            rocksdb_max_open_files,
+            rocksdb_max_background_jobs,
             rocksdb_block_cache_bytes,
             rocksdb_write_buffer_manager_bytes,
             rocksdb_write_buffer_size_bytes,
@@ -729,23 +795,129 @@ where
     }
 }
 
+fn clamp_usize(value: usize, min: usize, max: usize) -> usize {
+    value.clamp(min, max)
+}
+
+fn clamp_bytes_to_usize(value: u64, min: u64, max: u64) -> usize {
+    value.clamp(min, max).min(usize::MAX as u64) as usize
+}
+
+fn round_down_to_mib(value: u64) -> u64 {
+    (value / BYTES_PER_MIB) * BYTES_PER_MIB
+}
+
+fn detect_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(FALLBACK_HOST_CPU_COUNT)
+}
+
+fn detect_memory_limit_bytes() -> Option<u64> {
+    let physical = detect_physical_memory_bytes();
+    let cgroup = detect_cgroup_memory_limit_bytes();
+
+    match (cgroup, physical) {
+        (Some(cgroup_limit), Some(physical_limit)) if cgroup_limit > 0 => {
+            Some(cgroup_limit.min(physical_limit))
+        }
+        (Some(cgroup_limit), None) if cgroup_limit > 0 => Some(cgroup_limit),
+        (_, Some(physical_limit)) if physical_limit > 0 => Some(physical_limit),
+        _ => None,
+    }
+}
+
+fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        for path in [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ] {
+            let Ok(raw) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed == "max" {
+                continue;
+            }
+            if let Ok(value) = trimmed.parse::<u64>()
+                && value > 0
+            {
+                return Some(value);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn detect_physical_memory_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages <= 0 || page_size <= 0 {
+            None
+        } else {
+            Some((pages as u64).saturating_mul(page_size as u64))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn detect_file_descriptor_limit() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        if result != 0 {
+            return None;
+        }
+        if limit.rlim_cur == libc::RLIM_INFINITY {
+            return Some(FALLBACK_HOST_FD_LIMIT);
+        }
+        Some((limit.rlim_cur as usize).max(256))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
+    const TEST_HOST_RESOURCES: HostResources = HostResources {
+        file_descriptor_limit: 4096,
+        memory_limit_bytes: 1024 * 1024 * 1024,
+        cpu_count: 6,
+    };
+
     fn config_from(values: &[(&str, &str)]) -> Result<Config, String> {
         let values = values
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<BTreeMap<_, _>>();
-        Config::from_lookup(|key| values.get(key).cloned())
+        Config::from_lookup_with_resources(|key| values.get(key).cloned(), TEST_HOST_RESOURCES)
     }
 
     #[test]
     fn from_lookup_reports_all_missing_variables() {
-        let error = Config::from_lookup(|_| None).expect_err("expected missing config to fail");
+        let error = Config::from_lookup_with_resources(|_| None, TEST_HOST_RESOURCES)
+            .expect_err("expected missing config to fail");
 
         assert!(error.contains(KURA_PORT));
         assert!(error.contains(KURA_GRPC_PORT));
@@ -754,19 +926,56 @@ mod tests {
         assert!(error.contains(KURA_TMP_DIR));
         assert!(error.contains(KURA_DATA_DIR));
         assert!(error.contains(KURA_NODE_URL));
-        assert!(error.contains(KURA_PEERS));
-        assert!(error.contains(KURA_FILE_DESCRIPTOR_POOL_SIZE));
-        assert!(error.contains(KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS));
-        assert!(error.contains(KURA_SEGMENT_HANDLE_CACHE_SIZE));
-        assert!(error.contains(KURA_MEMORY_SOFT_LIMIT_BYTES));
-        assert!(error.contains(KURA_MEMORY_HARD_LIMIT_BYTES));
-        assert!(error.contains(KURA_MANIFEST_CACHE_MAX_BYTES));
-        assert!(error.contains(KURA_MAX_KEYVALUE_BYTES));
-        assert!(error.contains(KURA_METADATA_STORE_MAX_OPEN_FILES));
-        assert!(error.contains(KURA_METADATA_STORE_MAX_BACKGROUND_JOBS));
         assert!(error.contains(KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT));
         assert!(error.contains(KURA_OTEL_SERVICE_NAME));
         assert!(error.contains(KURA_OTEL_DEPLOYMENT_ENVIRONMENT));
+    }
+
+    #[test]
+    fn from_lookup_derives_resource_defaults_for_optional_tuning() {
+        let config = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect("expected config defaults to derive from host resources");
+
+        assert_eq!(config.peers, vec!["https://kura.example.com".to_owned()]);
+        assert_eq!(config.file_descriptor_pool_size, 256);
+        assert_eq!(config.file_descriptor_acquire_timeout_ms, 5_000);
+        assert_eq!(config.segment_handle_cache_size, 64);
+        assert_eq!(config.memory_soft_limit_bytes, 716 * BYTES_PER_MIB);
+        assert_eq!(config.memory_hard_limit_bytes, 870 * BYTES_PER_MIB);
+        assert_eq!(
+            config.manifest_cache_max_bytes,
+            (44 * BYTES_PER_MIB) as usize
+        );
+        assert_eq!(config.max_keyvalue_bytes, 1024 * 1024);
+        assert_eq!(config.rocksdb_max_open_files, 1024);
+        assert_eq!(config.rocksdb_max_background_jobs, 6);
+        assert_eq!(
+            config.rocksdb_block_cache_bytes,
+            (32 * BYTES_PER_MIB) as usize
+        );
+        assert_eq!(
+            config.rocksdb_write_buffer_manager_bytes,
+            (32 * BYTES_PER_MIB) as usize
+        );
+        assert_eq!(
+            config.rocksdb_write_buffer_size_bytes,
+            (8 * BYTES_PER_MIB) as usize
+        );
+        assert_eq!(config.rocksdb_max_write_buffer_number, 4);
     }
 
     #[test]
@@ -826,9 +1035,9 @@ mod tests {
         assert_eq!(config.max_keyvalue_bytes, 1_048_576);
         assert_eq!(config.rocksdb_max_open_files, 1024);
         assert_eq!(config.rocksdb_max_background_jobs, 4);
-        assert_eq!(config.rocksdb_block_cache_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.rocksdb_write_buffer_manager_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.rocksdb_write_buffer_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.rocksdb_block_cache_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.rocksdb_write_buffer_manager_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.rocksdb_write_buffer_size_bytes, 8 * 1024 * 1024);
         assert_eq!(config.rocksdb_max_write_buffer_number, 4);
         assert_eq!(config.analytics, None);
         assert_eq!(

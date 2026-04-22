@@ -62,31 +62,7 @@ mise x rust@1.94.1 -- cargo test
 mise x shellspec@0.28.1 -- shellspec
 ```
 
-Important runtime configuration:
-
-- `KURA_FILE_DESCRIPTOR_POOL_SIZE` controls how many application-managed file operations can hold a descriptor at once
-- `KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS` controls how long requests wait before backpressure fails the checkout
-- `KURA_PEERS` provides seed peers that Kura can use immediately, even before DNS discovery has converged
-- `KURA_DISCOVERY_DNS_NAME` optionally enables DNS-based node discovery. Every node resolved behind that name is probed and, if healthy, becomes a replication and bootstrap target automatically
-- `KURA_SEGMENT_HANDLE_CACHE_SIZE` caps how many long-lived segment read handles can stay pinned in the process, and it must stay below the FD pool size so transient operations keep headroom
-- `KURA_MEMORY_SOFT_LIMIT_BYTES` marks the point where Kura starts shedding optional memory use
-- `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
-- `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
-- `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
-- `KURA_METADATA_STORE_MAX_OPEN_FILES` controls the metadata store's own descriptor budget
-- `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` controls metadata-store flush and compaction concurrency
-- `KURA_METADATA_STORE_READ_CACHE_BYTES` caps the metadata store's read cache so hot metadata lookups do not grow RSS without bound
-- `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` caps total memory reserved for metadata write buffering
-- `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` controls the size of each metadata write buffer before flush
-- `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` controls how many metadata write buffers may stay in memory at once
-
-Prometheus also exposes live metadata-store memory gauges:
-
-- `kura_rocksdb_block_cache_usage_bytes`
-- `kura_rocksdb_block_cache_pinned_usage_bytes`
-- `kura_rocksdb_block_cache_capacity_bytes`
-- `kura_rocksdb_write_buffer_usage_bytes`
-- `kura_rocksdb_write_buffer_capacity_bytes`
+Runtime configuration is summarized in the table under [Runtime Model And Limits](#-runtime-model-and-limits). Kura now derives sensible defaults for the main FD, memory, and metadata-store budgets at startup when you do not set them explicitly.
 
 ## 🗺️ Project Areas
 
@@ -179,21 +155,32 @@ When peer mTLS is enabled:
 
 Kura is designed around explicit resource budgets instead of relying on ambient process limits.
 
-Important runtime configuration:
+When `Optional` is `Yes`, the `Default` column shows what Kura uses today. `auto` means Kura derives the value at startup from detected file-descriptor limits, memory limits, or CPU count.
 
-- 💾 `KURA_FILE_DESCRIPTOR_POOL_SIZE` controls how many application-managed file operations can hold a descriptor at once
-- ⏳ `KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS` controls how long requests wait before backpressure fails the checkout
-- 🧷 `KURA_SEGMENT_HANDLE_CACHE_SIZE` caps how many long-lived segment read handles can stay pinned in the process, and it must stay below the FD pool size so transient operations keep headroom
-- 🧠 `KURA_MEMORY_SOFT_LIMIT_BYTES` marks the point where Kura starts shedding optional memory use
-- 🚫 `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
-- 🗂️ `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
-- 📏 `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
-- 🪨 `KURA_METADATA_STORE_MAX_OPEN_FILES` controls the metadata store's own descriptor budget
-- 🛠️ `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` controls metadata-store flush and compaction concurrency
-- 📚 `KURA_METADATA_STORE_READ_CACHE_BYTES` caps the metadata store's read cache so hot metadata lookups do not grow RSS without bound
-- 🧮 `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` caps total memory reserved for metadata write buffering
-- 🧱 `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` controls the size of each metadata write buffer before flush
-- 🔢 `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` controls how many metadata write buffers may stay in memory at once
+| Name | Description | Optional | Default |
+| --- | --- | --- | --- |
+| `KURA_PORT` | Public HTTP port. | No | `—` |
+| `KURA_GRPC_PORT` | gRPC port for REAPI. | No | `—` |
+| `KURA_TENANT_ID` | Default tenant identifier for the node. | No | `—` |
+| `KURA_REGION` | Region label advertised in metrics and replication state. | No | `—` |
+| `KURA_TMP_DIR` | Temporary directory for staged request bodies and multipart assembly. | No | `—` |
+| `KURA_DATA_DIR` | Persistent directory for metadata state and segment files. | No | `—` |
+| `KURA_NODE_URL` | Canonical URL other peers use to reach this node. | No | `—` |
+| `KURA_PEERS` | Seed peer list used before discovery converges. | Yes | `KURA_NODE_URL` |
+| `KURA_DISCOVERY_DNS_NAME` | DNS name to probe for automatic peer discovery. | Yes | disabled |
+| `KURA_FILE_DESCRIPTOR_POOL_SIZE` | App-managed file-descriptor budget for request and background I/O. | Yes | auto |
+| `KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS` | How long a request waits before FD backpressure fails the checkout. | Yes | `5000` |
+| `KURA_SEGMENT_HANDLE_CACHE_SIZE` | Maximum number of pinned segment read handles; must stay below the FD pool size. | Yes | auto |
+| `KURA_MEMORY_SOFT_LIMIT_BYTES` | Soft watermark where Kura starts shedding optional memory use. | Yes | auto |
+| `KURA_MEMORY_HARD_LIMIT_BYTES` | Hard watermark where Kura pauses replication work and trims hot caches aggressively. | Yes | auto |
+| `KURA_MANIFEST_CACHE_MAX_BYTES` | Maximum size of the in-memory manifest hot cache. | Yes | auto |
+| `KURA_MAX_KEYVALUE_BYTES` | Maximum per-request keyvalue payload size on public and replication APIs. | Yes | `1048576` |
+| `KURA_METADATA_STORE_MAX_OPEN_FILES` | Descriptor budget reserved for the metadata store itself. | Yes | auto |
+| `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` | Background flush and compaction concurrency for the metadata store. | Yes | auto |
+| `KURA_METADATA_STORE_READ_CACHE_BYTES` | Capacity of the metadata-store read cache. | Yes | auto |
+| `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` | Total memory budget reserved for metadata write buffering. | Yes | auto |
+| `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` | Size of each metadata write buffer before flush. | Yes | auto |
+| `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` | Maximum number of metadata write buffers kept in memory. | Yes | auto |
 
 A minimal direct-binary deployment still looks like:
 
@@ -205,20 +192,6 @@ KURA_REGION=eu-central \
 KURA_TMP_DIR=/tmp/kura \
 KURA_DATA_DIR=/var/cache/kura \
 KURA_NODE_URL=http://cache-1.internal:4000 \
-KURA_PEERS=http://cache-1.internal:4000 \
-KURA_FILE_DESCRIPTOR_POOL_SIZE=128 \
-KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS=5000 \
-KURA_SEGMENT_HANDLE_CACHE_SIZE=32 \
-KURA_MEMORY_SOFT_LIMIT_BYTES=536870912 \
-KURA_MEMORY_HARD_LIMIT_BYTES=805306368 \
-KURA_MANIFEST_CACHE_MAX_BYTES=67108864 \
-KURA_MAX_KEYVALUE_BYTES=1048576 \
-KURA_METADATA_STORE_MAX_OPEN_FILES=1024 \
-KURA_METADATA_STORE_MAX_BACKGROUND_JOBS=4 \
-KURA_METADATA_STORE_READ_CACHE_BYTES=67108864 \
-KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES=67108864 \
-KURA_METADATA_STORE_WRITE_BUFFER_BYTES=16777216 \
-KURA_METADATA_STORE_MAX_WRITE_BUFFERS=4 \
 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces \
 KURA_OTEL_SERVICE_NAME=kura-eu-central \
 KURA_OTEL_DEPLOYMENT_ENVIRONMENT=production \
@@ -387,23 +360,7 @@ The runtime keeps decision caching, metrics, timeouts, and cryptographic primiti
 
 ### ⚙️ Runtime config reference
 
-Important runtime configuration:
-
-- `KURA_FILE_DESCRIPTOR_POOL_SIZE` controls how many application-managed file operations can hold a descriptor at once
-- `KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS` controls how long requests wait before backpressure fails the checkout
-- `KURA_PEERS` provides seed peers that Kura can use immediately, even before DNS discovery has converged
-- `KURA_DISCOVERY_DNS_NAME` optionally enables DNS-based node discovery. Every node resolved behind that name is probed and, if healthy, becomes a replication and bootstrap target automatically
-- `KURA_SEGMENT_HANDLE_CACHE_SIZE` caps how many long-lived segment read handles can stay pinned in the process, and it must stay below the FD pool size so transient operations keep headroom
-- `KURA_MEMORY_SOFT_LIMIT_BYTES` marks the point where Kura starts shedding optional memory use
-- `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
-- `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
-- `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
-- `KURA_METADATA_STORE_MAX_OPEN_FILES` controls the metadata store's own descriptor budget
-- `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` controls metadata-store flush and compaction concurrency
-- `KURA_METADATA_STORE_READ_CACHE_BYTES` caps the metadata store's read cache so hot metadata lookups do not grow RSS without bound
-- `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` caps total memory reserved for metadata write buffering
-- `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` controls the size of each metadata write buffer before flush
-- `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` controls how many metadata write buffers may stay in memory at once
+See the runtime configuration table in [Runtime Model And Limits](#-runtime-model-and-limits) for the current required and optional variables.
 
 ### 📊 Metrics reference
 
