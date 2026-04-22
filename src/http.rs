@@ -223,9 +223,22 @@ impl ReplicateArtifactQuery {
     }
 }
 
-fn required_param(params: &HashMap<String, String>, key: &str) -> Result<String, String> {
+fn alias_keys(key: &str) -> &'static [&'static str] {
+    match key {
+        "tenant_id" => &["account_handle"],
+        "namespace_id" => &["project_handle"],
+        _ => &[],
+    }
+}
+
+fn param_value<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a String> {
     params
         .get(key)
+        .or_else(|| alias_keys(key).iter().find_map(|alias| params.get(*alias)))
+}
+
+fn required_param(params: &HashMap<String, String>, key: &str) -> Result<String, String> {
+    param_value(params, key)
         .cloned()
         .ok_or_else(|| format!("Missing {key}"))
 }
@@ -394,8 +407,8 @@ async fn http_extension_metadata(
     path: &str,
     query: &HashMap<String, String>,
 ) -> HttpExtensionMetadata {
-    let tenant_id = query.get("tenant_id").cloned();
-    let mut namespace_id = query.get("namespace_id").cloned();
+    let tenant_id = param_value(query, "tenant_id").cloned();
+    let mut namespace_id = param_value(query, "namespace_id").cloned();
     let last_path_segment = path.rsplit('/').next().map(str::to_owned);
 
     match route {
@@ -1465,6 +1478,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_account_and_project_handles_work_through_router() {
+        let context = test_context(|_| {}).await;
+        let app = router(context.state.clone());
+
+        let put_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from("xcode-binary"))
+                    .expect("failed to build put request"),
+            )
+            .await
+            .expect("put request failed");
+        assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cache/cas/artifact-1?account_handle=acme&project_handle=ios")
+                    .body(Body::empty())
+                    .expect("failed to build get request"),
+            )
+            .await
+            .expect("get request failed");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(response_text(get_response).await, "xcode-binary");
+    }
+
+    #[tokio::test]
     async fn multipart_module_round_trip_works_through_router() {
         let context = test_context(|_| {}).await;
         let app = router(context.state.clone());
@@ -1579,6 +1624,25 @@ mod tests {
             extension_context.artifact_key.as_deref(),
             Some("builds/hash-1/Module.framework")
         );
+    }
+
+    #[tokio::test]
+    async fn extension_context_uses_legacy_handle_aliases() {
+        let context = test_context(|_| {}).await;
+        let query = parse_query_map(Some("account_handle=acme&project_handle=ios&hash=hash-1"));
+        let extension_context = extension_context_from_http(
+            &context.state,
+            "/api/cache/cas/{id}",
+            "GET",
+            "/api/cache/cas/artifact-1",
+            &query,
+            &BTreeMap::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(extension_context.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(extension_context.namespace_id.as_deref(), Some("ios"));
     }
 
     #[tokio::test]
