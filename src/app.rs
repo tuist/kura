@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -16,6 +16,7 @@ use crate::{
     io::IoController,
     memory::MemoryController,
     metrics::Metrics,
+    reapi,
     replication::{spawn_membership_task, spawn_outbox_task},
     state::AppState,
     store::Store,
@@ -59,6 +60,8 @@ pub async fn run() -> Result<(), String> {
         client,
         notify,
         members,
+        peer_nodes: RwLock::new(BTreeMap::new()),
+        bootstrapped_peers: tokio::sync::Mutex::new(BTreeSet::new()),
     });
 
     spawn_membership_task(state.clone());
@@ -67,16 +70,38 @@ pub async fn run() -> Result<(), String> {
 
     let router = http::router(state.clone());
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.port));
+    let grpc_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.grpc_port));
     info!("Kura service listening on {address}");
+    info!("Kura REAPI service listening on {grpc_address}");
 
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|error| format!("failed to bind TCP listener: {error}"))?;
+    let grpc_listener = tokio::net::TcpListener::bind(grpc_address)
+        .await
+        .map_err(|error| format!("failed to bind gRPC listener: {error}"))?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let grpc_state = state.clone();
+    let grpc_handle = tokio::spawn(async move {
+        let grpc_shutdown = async move {
+            let mut shutdown_rx = shutdown_rx;
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let _ = shutdown_rx.changed().await;
+        };
+
+        if let Err(error) = reapi::serve(grpc_listener, grpc_state, grpc_shutdown).await {
+            tracing::error!("gRPC server failed: {error}");
+        }
+    });
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|error| format!("server error: {error}"))?;
+    let _ = shutdown_tx.send(true);
+    let _ = grpc_handle.await;
 
     if let Some(provider) = tracer_provider {
         if let Err(error) = provider.shutdown() {

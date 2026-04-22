@@ -57,6 +57,10 @@ pub struct Metrics {
     manifest_index_rebuild_duration: Histogram,
     outbox_messages: Gauge,
     multipart_uploads: Gauge,
+    discovered_peer_nodes: Gauge,
+    bootstrap_runs: Family<BootstrapResultLabels, Counter>,
+    bootstrap_duration: Histogram,
+    bootstrap_applied_items: Family<BootstrapItemLabels, Counter>,
     segment_generation_counts: Family<SegmentGenerationLabels, Gauge>,
     process_resident_memory_bytes: Gauge,
     process_virtual_memory_bytes: Gauge,
@@ -125,6 +129,10 @@ impl Metrics {
         let manifest_index_rebuild_duration = Histogram::new(exponential_buckets(0.0005, 2.0, 16));
         let outbox_messages = Gauge::default();
         let multipart_uploads = Gauge::default();
+        let discovered_peer_nodes = Gauge::default();
+        let bootstrap_runs = Family::<BootstrapResultLabels, Counter>::default();
+        let bootstrap_duration = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        let bootstrap_applied_items = Family::<BootstrapItemLabels, Counter>::default();
         let segment_generation_counts = Family::<SegmentGenerationLabels, Gauge>::default();
         let process_resident_memory_bytes = Gauge::default();
         let process_virtual_memory_bytes = Gauge::default();
@@ -329,6 +337,26 @@ impl Metrics {
             multipart_uploads.clone(),
         );
         registry.register(
+            "kura_discovered_peer_nodes",
+            "Peer nodes currently discovered through health checks and DNS",
+            discovered_peer_nodes.clone(),
+        );
+        registry.register(
+            "kura_bootstrap_runs_total",
+            "Bootstrap runs from newly discovered peers by result",
+            bootstrap_runs.clone(),
+        );
+        registry.register(
+            "kura_bootstrap_duration_seconds",
+            "Time spent bootstrapping from newly discovered peers",
+            bootstrap_duration.clone(),
+        );
+        registry.register(
+            "kura_bootstrap_applied_items_total",
+            "Tombstones and artifacts applied during bootstrap",
+            bootstrap_applied_items.clone(),
+        );
+        registry.register(
             "kura_segment_generation_count",
             "Segments currently tracked by generation and artifact kind",
             segment_generation_counts.clone(),
@@ -418,6 +446,10 @@ impl Metrics {
             manifest_index_rebuild_duration,
             outbox_messages,
             multipart_uploads,
+            discovered_peer_nodes,
+            bootstrap_runs,
+            bootstrap_duration,
+            bootstrap_applied_items,
             segment_generation_counts,
             process_resident_memory_bytes,
             process_virtual_memory_bytes,
@@ -698,6 +730,39 @@ impl Metrics {
         self.multipart_uploads.set(count as i64);
     }
 
+    pub fn update_discovered_peer_nodes(&self, count: usize) {
+        self.discovered_peer_nodes.set(count as i64);
+    }
+
+    pub fn record_bootstrap_run(
+        &self,
+        result: &str,
+        duration: Duration,
+        tombstones_applied: u64,
+        artifacts_applied: u64,
+    ) {
+        self.bootstrap_runs
+            .get_or_create(&BootstrapResultLabels {
+                result: result.to_owned(),
+            })
+            .inc();
+        self.bootstrap_duration.observe(duration.as_secs_f64());
+        if tombstones_applied > 0 {
+            self.bootstrap_applied_items
+                .get_or_create(&BootstrapItemLabels {
+                    item_type: "namespace_tombstone".to_owned(),
+                })
+                .inc_by(tombstones_applied);
+        }
+        if artifacts_applied > 0 {
+            self.bootstrap_applied_items
+                .get_or_create(&BootstrapItemLabels {
+                    item_type: "artifact".to_owned(),
+                })
+                .inc_by(artifacts_applied);
+        }
+    }
+
     pub fn update_segment_generation_count(
         &self,
         kind: ArtifactKind,
@@ -870,6 +935,16 @@ struct SegmentGenerationLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BootstrapResultLabels {
+    result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BootstrapItemLabels {
+    item_type: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MemoryPressureTransitionLabels {
     from: String,
     to: String,
@@ -932,6 +1007,8 @@ mod tests {
         metrics.record_manifest_index_rebuild("ok", Duration::from_millis(3));
         metrics.update_outbox_messages(4);
         metrics.update_multipart_uploads(2);
+        metrics.update_discovered_peer_nodes(3);
+        metrics.record_bootstrap_run("ok", Duration::from_millis(6), 2, 5);
         metrics.update_segment_generation_count(ArtifactKind::Xcode, "old", 1);
         metrics.update_process_memory(1024, 2048);
         metrics.update_memory_limits(4_096, 8_192);
@@ -967,6 +1044,10 @@ mod tests {
         assert!(rendered.contains("kura_manifest_index_rebuilds_total"));
         assert!(rendered.contains("kura_outbox_messages"));
         assert!(rendered.contains("kura_multipart_uploads"));
+        assert!(rendered.contains("kura_discovered_peer_nodes"));
+        assert!(rendered.contains("kura_bootstrap_runs_total"));
+        assert!(rendered.contains("kura_bootstrap_duration_seconds"));
+        assert!(rendered.contains("kura_bootstrap_applied_items_total"));
         assert!(rendered.contains("kura_segment_generation_count"));
         assert!(rendered.contains("kura_process_resident_memory_bytes"));
         assert!(rendered.contains("kura_memory_pressure_state"));

@@ -1,7 +1,10 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use reqwest::Client;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::{
     config::Config, io::IoController, memory::MemoryController, metrics::Metrics, store::Store,
@@ -16,6 +19,8 @@ pub struct AppState {
     pub client: Client,
     pub notify: Notify,
     pub members: RwLock<BTreeSet<String>>,
+    pub peer_nodes: RwLock<BTreeMap<String, String>>,
+    pub bootstrapped_peers: Mutex<BTreeSet<String>>,
 }
 
 pub type SharedState = Arc<AppState>;

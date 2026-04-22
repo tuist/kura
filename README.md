@@ -10,7 +10,9 @@
 - ⚡ Hot reads come from local disk
 - 🪨 Local metadata, multipart state, and the replication outbox live in RocksDB
 - 🔁 Blobs and cache metadata replicate to peer nodes with eventual consistency
-- 📦 The HTTP API covers key value entries, Xcode CAS artifacts, Gradle artifacts, multipart module uploads, and namespace clean
+- 🔎 Nodes can discover peers through DNS and bootstrap themselves from already-running nodes
+- 📦 The HTTP API covers key value entries, Xcode CAS artifacts, Gradle artifacts, multipart module uploads, Nx self-hosted cache artifacts, Metro cache artifacts, and namespace clean
+- 🧰 The gRPC API exposes the Bazel Remote Execution cache services used by Bazel and Buck2
 - 📊 The local stack includes Grafana, Prometheus, Loki, Promtail, and Tempo traces
 
 ## Local stack 🧪
@@ -26,10 +28,19 @@ Useful endpoints:
 - `http://localhost:4101/up`
 - `http://localhost:4102/up`
 - `http://localhost:4103/up`
+- `grpc://localhost:5101` for Bazel/Buck2 REAPI against `kura-us`
+- `grpc://localhost:5102` for Bazel/Buck2 REAPI against `kura-eu`
+- `grpc://localhost:5103` for Bazel/Buck2 REAPI against `kura-ap`
 - `http://localhost:3000` for Grafana with `admin` / `admin`
 - `http://localhost:9090` for Prometheus
 - `http://localhost:3100` for Loki
 - `http://localhost:3200` for Tempo
+
+Supported cache protocols:
+
+- `Bazel` and `Buck2`: Bazel Remote Execution API v2 over gRPC on `KURA_GRPC_PORT`
+- `Nx`: self-hosted remote cache API on `GET/PUT /v1/cache/{hash}`
+- `React Native Metro`: `HttpStore` / `HttpGetStore` on `GET/PUT /api/metro/cache/{cache_key}`
 
 ## Toolchain 🛠️
 
@@ -51,6 +62,8 @@ Important runtime configuration:
 
 - `KURA_FILE_DESCRIPTOR_POOL_SIZE` controls how many application-managed file operations can hold a descriptor at once
 - `KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS` controls how long requests wait before backpressure fails the checkout
+- `KURA_PEERS` provides seed peers that Kura can use immediately, even before DNS discovery has converged
+- `KURA_DISCOVERY_DNS_NAME` optionally enables DNS-based node discovery. Every node resolved behind that name is probed and, if healthy, becomes a replication and bootstrap target automatically
 - `KURA_SEGMENT_HANDLE_CACHE_SIZE` caps how many long-lived segment read handles can stay pinned in the process, and it must stay below the FD pool size so transient operations keep headroom
 - `KURA_MEMORY_SOFT_LIMIT_BYTES` marks the point where Kura starts shedding optional memory use
 - `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively

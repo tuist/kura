@@ -54,10 +54,29 @@ impl ArtifactKind {
             Self::Xcode | Self::Gradle | Self::Module => ArtifactClass::Blob,
         }
     }
+
+    pub fn from_dimensions(
+        client: ArtifactClient,
+        artifact_class: ArtifactClass,
+    ) -> Result<Self, String> {
+        match (client, artifact_class) {
+            (ArtifactClient::Generic, ArtifactClass::ActionCache) => Ok(Self::Keyvalue),
+            (ArtifactClient::Xcode, ArtifactClass::Blob) => Ok(Self::Xcode),
+            (ArtifactClient::Gradle, ArtifactClass::Blob) => Ok(Self::Gradle),
+            (ArtifactClient::Module, ArtifactClass::Blob) => Ok(Self::Module),
+            _ => Err(format!(
+                "unsupported artifact dimensions client={} artifact_class={}",
+                client.as_str(),
+                artifact_class.as_str()
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::artifact::{class::ArtifactClass, client::ArtifactClient};
+
     use super::ArtifactKind;
 
     #[test]
@@ -90,5 +109,20 @@ mod tests {
         );
         assert_eq!(ArtifactKind::Xcode.client().as_str(), "xcode");
         assert_eq!(ArtifactKind::Xcode.artifact_class().as_str(), "blob");
+    }
+
+    #[test]
+    fn derives_kind_from_normalized_dimensions() {
+        assert_eq!(
+            ArtifactKind::from_dimensions(
+                ArtifactKind::Gradle.client(),
+                ArtifactKind::Gradle.artifact_class()
+            )
+            .expect("gradle dimensions should map back to gradle"),
+            ArtifactKind::Gradle
+        );
+        assert!(
+            ArtifactKind::from_dimensions(ArtifactClient::Generic, ArtifactClass::Blob).is_err()
+        );
     }
 }

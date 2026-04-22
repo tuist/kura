@@ -9,23 +9,19 @@ use crate::artifact::{
 pub struct ArtifactManifest {
     pub artifact_id: String,
     pub kind: ArtifactKind,
-    #[serde(default)]
     pub client: ArtifactClient,
-    #[serde(default)]
     pub artifact_class: ArtifactClass,
     pub namespace_id: String,
     pub key: String,
     pub content_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_offset: Option<u64>,
     pub size: u64,
-    #[serde(default)]
     pub version_ms: u64,
-    #[serde(default)]
     pub created_at_ms: u64,
 }
 
@@ -64,13 +60,69 @@ impl ArtifactManifest {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedManifestRecord {
+    pub client: ArtifactClient,
+    pub artifact_class: ArtifactClass,
+    pub namespace_id: String,
+    pub key: String,
+    pub content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_offset: Option<u64>,
+    pub size: u64,
+    pub version_ms: u64,
+    pub created_at_ms: u64,
+}
+
+impl PersistedManifestRecord {
+    pub fn from_manifest(manifest: &ArtifactManifest) -> Self {
+        Self {
+            client: manifest.client,
+            artifact_class: manifest.artifact_class,
+            namespace_id: manifest.namespace_id.clone(),
+            key: manifest.key.clone(),
+            content_type: manifest.content_type.clone(),
+            blob_path: manifest.blob_path.clone(),
+            segment_id: manifest.segment_id.clone(),
+            segment_offset: manifest.segment_offset,
+            size: manifest.size,
+            version_ms: manifest.version_ms,
+            created_at_ms: manifest.created_at_ms,
+        }
+    }
+
+    pub fn into_manifest(self, artifact_id: &str) -> Result<ArtifactManifest, String> {
+        let kind = ArtifactKind::from_dimensions(self.client, self.artifact_class)?;
+
+        Ok(ArtifactManifest {
+            artifact_id: artifact_id.to_owned(),
+            kind,
+            client: self.client,
+            artifact_class: self.artifact_class,
+            namespace_id: self.namespace_id,
+            key: self.key,
+            content_type: self.content_type,
+            blob_path: self.blob_path,
+            segment_id: self.segment_id,
+            segment_offset: self.segment_offset,
+            size: self.size,
+            version_ms: self.version_ms,
+            created_at_ms: self.created_at_ms,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::artifact::{
         class::ArtifactClass, client::ArtifactClient, kind::ArtifactKind, storage_kind::StorageKind,
     };
 
-    use super::ArtifactManifest;
+    use super::{ArtifactManifest, PersistedManifestRecord};
 
     #[test]
     fn exposes_normalized_storage_metadata() {
@@ -101,5 +153,30 @@ mod tests {
         assert_eq!(metadata.size_bytes, 128);
         assert_eq!(metadata.version_ms, 100);
         assert_eq!(metadata.created_at_ms, 90);
+    }
+
+    #[test]
+    fn persisted_record_round_trips_without_storing_kind() {
+        let manifest = ArtifactManifest {
+            artifact_id: "artifact".into(),
+            kind: ArtifactKind::Gradle,
+            client: ArtifactClient::Gradle,
+            artifact_class: ArtifactClass::Blob,
+            namespace_id: "android".into(),
+            key: "artifact".into(),
+            content_type: "application/octet-stream".into(),
+            blob_path: Some("/tmp/blob".into()),
+            segment_id: None,
+            segment_offset: None,
+            size: 64,
+            version_ms: 200,
+            created_at_ms: 150,
+        };
+
+        let restored = PersistedManifestRecord::from_manifest(&manifest)
+            .into_manifest(&manifest.artifact_id)
+            .expect("persisted record should restore manifest");
+
+        assert_eq!(restored, manifest);
     }
 }

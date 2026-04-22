@@ -1,30 +1,44 @@
 pub mod operation;
 pub mod outbox_message;
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+    path::Path,
+    time::Duration,
+};
 
+use futures_util::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
-use tokio::time::sleep;
+use serde::Deserialize;
+use tokio::{io::AsyncWriteExt, time::sleep};
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, field, warn};
 
 use crate::{
     artifact::manifest::ArtifactManifest,
+    config::Config,
     constants::REPLICATION_RETRY_SECS,
     state::SharedState,
+    store::{ManifestPage, NamespaceTombstonePage},
     telemetry::inject_current_trace_context,
-    utils::{replication_target_label, url_encode},
+    utils::{replication_target_label, temp_file_path, url_encode},
 };
 
 use self::{operation::ReplicationOperation, outbox_message::OutboxMessage};
 
-pub fn enqueue_replication_for_artifact(state: &SharedState, manifest: &ArtifactManifest) {
-    for peer in state
-        .config
-        .peers
-        .iter()
-        .filter(|peer| *peer != &state.config.node_url)
-    {
+const BOOTSTRAP_PAGE_LIMIT: usize = 256;
+
+#[derive(Debug, Deserialize)]
+struct PeerStatusPayload {
+    region: String,
+    tenant_id: String,
+    node_url: String,
+}
+
+#[cfg(test)]
+pub async fn enqueue_replication_for_artifact(state: &SharedState, manifest: &ArtifactManifest) {
+    for peer in replication_targets(state).await {
         if let Err(error) = state.store.enqueue(OutboxMessage {
             target: peer.clone(),
             operation: ReplicationOperation::UpsertArtifact {
@@ -46,12 +60,8 @@ pub fn spawn_membership_task(state: SharedState) {
     tokio::spawn(async move {
         loop {
             let mut members = BTreeSet::new();
-            for peer in state
-                .config
-                .peers
-                .iter()
-                .filter(|peer| *peer != &state.config.node_url)
-            {
+            let mut peer_nodes = BTreeMap::new();
+            for peer in discovery_targets(&state.config).await {
                 match state
                     .client
                     .get(format!("{peer}/_internal/status"))
@@ -59,15 +69,17 @@ pub fn spawn_membership_task(state: SharedState) {
                     .await
                 {
                     Ok(response) if response.status().is_success() => match response
-                        .json::<serde_json::Value>()
+                        .json::<PeerStatusPayload>()
                         .await
                     {
                         Ok(payload) => {
-                            if let Some(region) =
-                                payload.get("region").and_then(|value| value.as_str())
+                            if payload.tenant_id != state.config.tenant_id
+                                || payload.node_url == state.config.node_url
                             {
-                                members.insert(region.to_owned());
+                                continue;
                             }
+                            members.insert(payload.region.clone());
+                            peer_nodes.insert(payload.node_url, payload.region);
                         }
                         Err(error) => warn!("failed to decode peer status from {peer}: {error}"),
                     },
@@ -79,6 +91,33 @@ pub fn spawn_membership_task(state: SharedState) {
             }
 
             *state.members.write().await = members;
+            let (discovered_peers, lost_peers) = {
+                let mut known_peers = state.peer_nodes.write().await;
+                let lost_peers = known_peers
+                    .keys()
+                    .filter(|peer| !peer_nodes.contains_key(*peer))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let discovered_peers = peer_nodes
+                    .keys()
+                    .filter(|peer| !known_peers.contains_key(*peer))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                *known_peers = peer_nodes;
+                (discovered_peers, lost_peers)
+            };
+            if !lost_peers.is_empty() {
+                let mut bootstrapped = state.bootstrapped_peers.lock().await;
+                for peer in lost_peers {
+                    bootstrapped.remove(&peer);
+                }
+            }
+            state
+                .metrics
+                .update_discovered_peer_nodes(state.peer_nodes.read().await.len());
+            for peer in discovered_peers {
+                maybe_spawn_bootstrap_task(state.clone(), peer).await;
+            }
             sleep(Duration::from_secs(2)).await;
         }
     });
@@ -103,6 +142,276 @@ pub fn spawn_outbox_task(state: SharedState) {
             }
         }
     });
+}
+
+pub async fn replication_targets(state: &SharedState) -> Vec<String> {
+    let mut targets = state.config.peers.iter().cloned().collect::<BTreeSet<_>>();
+    targets.extend(state.peer_nodes.read().await.keys().cloned());
+    targets.remove(&state.config.node_url);
+    targets.into_iter().collect()
+}
+
+async fn maybe_spawn_bootstrap_task(state: SharedState, peer: String) {
+    let mut bootstrapped = state.bootstrapped_peers.lock().await;
+    if !bootstrapped.insert(peer.clone()) {
+        return;
+    }
+    drop(bootstrapped);
+
+    tokio::spawn(async move {
+        let started_at = std::time::Instant::now();
+        let result = bootstrap_from_peer(&state, &peer).await;
+        match result {
+            Ok(stats) => {
+                state.metrics.record_bootstrap_run(
+                    "ok",
+                    started_at.elapsed(),
+                    stats.tombstones_applied,
+                    stats.artifacts_applied,
+                );
+            }
+            Err(error) => {
+                warn!("bootstrap from {peer} failed: {error}");
+                state
+                    .metrics
+                    .record_bootstrap_run("error", started_at.elapsed(), 0, 0);
+                state.bootstrapped_peers.lock().await.remove(&peer);
+            }
+        }
+    });
+}
+
+async fn bootstrap_from_peer(state: &SharedState, peer: &str) -> Result<BootstrapStats, String> {
+    let tombstones_applied = bootstrap_namespace_tombstones_from_peer(state, peer).await?;
+    let artifacts_applied = bootstrap_manifests_from_peer(state, peer).await?;
+    Ok(BootstrapStats {
+        tombstones_applied,
+        artifacts_applied,
+    })
+}
+
+async fn bootstrap_namespace_tombstones_from_peer(
+    state: &SharedState,
+    peer: &str,
+) -> Result<u64, String> {
+    let mut after = None;
+    let mut applied = 0_u64;
+
+    loop {
+        let page = fetch_bootstrap_tombstones_page(state, peer, after.as_deref()).await?;
+        for tombstone in &page.tombstones {
+            if state
+                .store
+                .apply_replicated_namespace_delete(&tombstone.namespace_id, tombstone.version_ms)
+                .await?
+            {
+                applied += 1;
+            }
+        }
+
+        match page.next_after {
+            Some(next_after) => after = Some(next_after),
+            None => return Ok(applied),
+        }
+    }
+}
+
+async fn bootstrap_manifests_from_peer(state: &SharedState, peer: &str) -> Result<u64, String> {
+    let mut after = None;
+    let mut applied = 0_u64;
+
+    loop {
+        let page = fetch_bootstrap_manifests_page(state, peer, after.as_deref()).await?;
+        for manifest in &page.manifests {
+            if !state.store.artifact_version_is_current(
+                manifest.kind,
+                &manifest.namespace_id,
+                &manifest.key,
+                manifest.version_ms,
+            )? {
+                continue;
+            }
+
+            if bootstrap_artifact_from_peer(state, peer, manifest).await? {
+                applied += 1;
+            }
+        }
+
+        match page.next_after {
+            Some(next_after) => after = Some(next_after),
+            None => return Ok(applied),
+        }
+    }
+}
+
+async fn bootstrap_artifact_from_peer(
+    state: &SharedState,
+    peer: &str,
+    manifest: &ArtifactManifest,
+) -> Result<bool, String> {
+    let url = format!(
+        "{peer}/_internal/bootstrap/artifacts/{}",
+        url_encode(&manifest.artifact_id)
+    );
+    let response = state
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("bootstrap artifact request failed: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| format!("bootstrap artifact response failed: {error}"))?;
+
+    if manifest.kind == crate::artifact::kind::ArtifactKind::Keyvalue {
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("failed to read bootstrap keyvalue body: {error}"))?;
+        return state
+            .store
+            .apply_replicated_artifact_from_bytes(
+                manifest.kind,
+                &manifest.namespace_id,
+                &manifest.key,
+                &manifest.content_type,
+                bytes.as_ref(),
+                manifest.version_ms,
+            )
+            .await;
+    }
+
+    let temp_path = temp_file_path(&state.config.tmp_dir.join("bootstrap"), "bootstrap");
+    stream_response_to_temp(state, response, &temp_path).await?;
+    state
+        .store
+        .apply_replicated_artifact_from_path(
+            manifest.kind,
+            &manifest.namespace_id,
+            &manifest.key,
+            &manifest.content_type,
+            &temp_path,
+            manifest.version_ms,
+        )
+        .await
+}
+
+async fn stream_response_to_temp(
+    state: &SharedState,
+    response: reqwest::Response,
+    path: &Path,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "bootstrap temp path is missing a parent directory".to_string())?;
+    state.io.create_dir_all(parent).await?;
+    let mut destination = state.io.create_file(path).await?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("failed to stream bootstrap body: {error}"))?;
+        destination
+            .write_all(&chunk)
+            .await
+            .map_err(|error| format!("failed to persist bootstrap body: {error}"))?;
+    }
+    destination
+        .flush()
+        .await
+        .map_err(|error| format!("failed to flush bootstrap body: {error}"))?;
+    Ok(())
+}
+
+async fn fetch_bootstrap_manifests_page(
+    state: &SharedState,
+    peer: &str,
+    after: Option<&str>,
+) -> Result<ManifestPage, String> {
+    let mut url = format!("{peer}/_internal/bootstrap/manifests?limit={BOOTSTRAP_PAGE_LIMIT}");
+    if let Some(after) = after {
+        url.push_str("&after=");
+        url.push_str(&url_encode(after));
+    }
+
+    state
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("bootstrap manifest request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("bootstrap manifest response failed: {error}"))?
+        .json::<ManifestPage>()
+        .await
+        .map_err(|error| format!("failed to decode bootstrap manifest page: {error}"))
+}
+
+async fn fetch_bootstrap_tombstones_page(
+    state: &SharedState,
+    peer: &str,
+    after: Option<&str>,
+) -> Result<NamespaceTombstonePage, String> {
+    let mut url =
+        format!("{peer}/_internal/bootstrap/namespace_tombstones?limit={BOOTSTRAP_PAGE_LIMIT}");
+    if let Some(after) = after {
+        url.push_str("&after=");
+        url.push_str(&url_encode(after));
+    }
+
+    state
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("bootstrap tombstone request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("bootstrap tombstone response failed: {error}"))?
+        .json::<NamespaceTombstonePage>()
+        .await
+        .map_err(|error| format!("failed to decode bootstrap tombstone page: {error}"))
+}
+
+async fn discovery_targets(config: &Config) -> Vec<String> {
+    let mut targets = config.peers.iter().cloned().collect::<BTreeSet<_>>();
+    let Some(dns_name) = &config.discovery_dns_name else {
+        return targets.into_iter().collect();
+    };
+
+    let Ok(node_url) = reqwest::Url::parse(&config.node_url) else {
+        return targets.into_iter().collect();
+    };
+    let Some(port) = node_url.port_or_known_default() else {
+        return targets.into_iter().collect();
+    };
+    let scheme = node_url.scheme().to_owned();
+
+    match tokio::net::lookup_host((dns_name.as_str(), port)).await {
+        Ok(addresses) => {
+            for address in addresses {
+                targets.insert(format!(
+                    "{scheme}://{}:{port}",
+                    format_ip_for_url(address.ip())
+                ));
+            }
+        }
+        Err(error) => warn!("dns discovery lookup failed for {dns_name}:{port}: {error}"),
+    }
+
+    targets.into_iter().collect()
+}
+
+fn format_ip_for_url(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+struct BootstrapStats {
+    tombstones_applied: u64,
+    artifacts_applied: u64,
 }
 
 pub async fn process_outbox(state: &SharedState) -> Result<(), String> {
@@ -304,7 +613,7 @@ mod tests {
             .await
             .expect("artifact should persist");
 
-        enqueue_replication_for_artifact(&ctx.state, &manifest);
+        enqueue_replication_for_artifact(&ctx.state, &manifest).await;
 
         let queued = ctx
             .state

@@ -4,23 +4,12 @@ use crate::segment::{generation::SegmentGeneration, reference::SegmentReference}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentState {
-    #[serde(default)]
     pub old: Vec<SegmentReference>,
-    #[serde(default)]
     pub current: Vec<SegmentReference>,
-    #[serde(default)]
     pub new: Vec<SegmentReference>,
 }
 
 impl SegmentState {
-    pub fn from_legacy_active(segment_id: String, created_at_ms: u64) -> Self {
-        Self {
-            old: Vec::new(),
-            current: Vec::new(),
-            new: vec![SegmentReference::new(segment_id, created_at_ms)],
-        }
-    }
-
     pub fn active(&self) -> Option<&SegmentReference> {
         self.new.last()
     }

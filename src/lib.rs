@@ -7,6 +7,7 @@ mod io;
 mod memory;
 mod metrics;
 mod multipart;
+mod reapi;
 mod replication;
 mod segment;
 mod state;

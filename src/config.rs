@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use tokio::fs;
 
 const KURA_PORT: &str = "KURA_PORT";
+const KURA_GRPC_PORT: &str = "KURA_GRPC_PORT";
 const KURA_TENANT_ID: &str = "KURA_TENANT_ID";
 const KURA_REGION: &str = "KURA_REGION";
 const KURA_TMP_DIR: &str = "KURA_TMP_DIR";
 const KURA_DATA_DIR: &str = "KURA_DATA_DIR";
 const KURA_NODE_URL: &str = "KURA_NODE_URL";
 const KURA_PEERS: &str = "KURA_PEERS";
+const KURA_DISCOVERY_DNS_NAME: &str = "KURA_DISCOVERY_DNS_NAME";
 const KURA_FILE_DESCRIPTOR_POOL_SIZE: &str = "KURA_FILE_DESCRIPTOR_POOL_SIZE";
 const KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS: &str = "KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS";
 const KURA_SEGMENT_HANDLE_CACHE_SIZE: &str = "KURA_SEGMENT_HANDLE_CACHE_SIZE";
@@ -25,12 +27,14 @@ const KURA_OTEL_DEPLOYMENT_ENVIRONMENT: &str = "KURA_OTEL_DEPLOYMENT_ENVIRONMENT
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
+    pub grpc_port: u16,
     pub tenant_id: String,
     pub region: String,
     pub tmp_dir: PathBuf,
     pub data_dir: PathBuf,
     pub node_url: String,
     pub peers: Vec<String>,
+    pub discovery_dns_name: Option<String>,
     pub file_descriptor_pool_size: usize,
     pub file_descriptor_acquire_timeout_ms: u64,
     pub segment_handle_cache_size: usize,
@@ -67,6 +71,16 @@ impl Config {
                     }
                 }
             });
+        let grpc_port =
+            required_value(&mut lookup, KURA_GRPC_PORT, &mut missing).and_then(|value| match value
+                .parse::<u16>(
+            ) {
+                Ok(port) => Some(port),
+                Err(_) => {
+                    invalid.push(format!("{KURA_GRPC_PORT} must be a valid u16"));
+                    None
+                }
+            });
         let tenant_id = required_value(&mut lookup, KURA_TENANT_ID, &mut missing);
         let region = required_value(&mut lookup, KURA_REGION, &mut missing);
         let tmp_dir = required_value(&mut lookup, KURA_TMP_DIR, &mut missing).map(PathBuf::from);
@@ -80,6 +94,9 @@ impl Config {
                 .map(ToOwned::to_owned)
                 .collect()
         });
+        let discovery_dns_name = lookup(KURA_DISCOVERY_DNS_NAME)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         let file_descriptor_pool_size =
             required_value(&mut lookup, KURA_FILE_DESCRIPTOR_POOL_SIZE, &mut missing).and_then(
                 |value| match value.parse::<usize>() {
@@ -293,12 +310,14 @@ impl Config {
 
         Ok(Self {
             port: port.expect("port should be present when configuration is valid"),
+            grpc_port: grpc_port.expect("grpc_port should be present when configuration is valid"),
             tenant_id: tenant_id.expect("tenant_id should be present when configuration is valid"),
             region: region.expect("region should be present when configuration is valid"),
             tmp_dir: tmp_dir.expect("tmp_dir should be present when configuration is valid"),
             data_dir: data_dir.expect("data_dir should be present when configuration is valid"),
             node_url: node_url.expect("node_url should be present when configuration is valid"),
             peers: peers.expect("peers should be present when configuration is valid"),
+            discovery_dns_name,
             file_descriptor_pool_size: file_descriptor_pool_size
                 .expect("file_descriptor_pool_size should be present when configuration is valid"),
             file_descriptor_acquire_timeout_ms: file_descriptor_acquire_timeout_ms.expect(
@@ -376,6 +395,7 @@ mod tests {
         let error = Config::from_lookup(|_| None).expect_err("expected missing config to fail");
 
         assert!(error.contains(KURA_PORT));
+        assert!(error.contains(KURA_GRPC_PORT));
         assert!(error.contains(KURA_TENANT_ID));
         assert!(error.contains(KURA_REGION));
         assert!(error.contains(KURA_TMP_DIR));
@@ -400,6 +420,7 @@ mod tests {
     fn from_lookup_parses_overrides() {
         let config = config_from(&[
             (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
             (KURA_TENANT_ID, "acme"),
             (KURA_REGION, "eu_west"),
             (KURA_TMP_DIR, "/tmp/kura"),
@@ -428,6 +449,7 @@ mod tests {
         .expect("expected config overrides to parse");
 
         assert_eq!(config.port, 4500);
+        assert_eq!(config.grpc_port, 5500);
         assert_eq!(config.tenant_id, "acme");
         assert_eq!(config.region, "eu_west");
         assert_eq!(config.tmp_dir, PathBuf::from("/tmp/kura"));
@@ -440,6 +462,7 @@ mod tests {
                 "https://kura-b.example.com".to_owned()
             ]
         );
+        assert_eq!(config.discovery_dns_name, None);
         assert_eq!(config.file_descriptor_pool_size, 64);
         assert_eq!(config.file_descriptor_acquire_timeout_ms, 5000);
         assert_eq!(config.segment_handle_cache_size, 16);
@@ -461,6 +484,7 @@ mod tests {
     fn from_lookup_reports_invalid_port() {
         let error = config_from(&[
             (KURA_PORT, "invalid"),
+            (KURA_GRPC_PORT, "invalid"),
             (KURA_TENANT_ID, "acme"),
             (KURA_REGION, "eu_west"),
             (KURA_TMP_DIR, "/tmp/kura"),
@@ -486,6 +510,7 @@ mod tests {
         .expect_err("expected invalid port to fail");
 
         assert!(error.contains(KURA_PORT));
+        assert!(error.contains(KURA_GRPC_PORT));
         assert!(error.contains("valid u16"));
         assert!(error.contains(KURA_FILE_DESCRIPTOR_POOL_SIZE));
         assert!(error.contains(KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS));
@@ -499,9 +524,46 @@ mod tests {
     }
 
     #[test]
+    fn from_lookup_parses_optional_discovery_dns_name() {
+        let config = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com"),
+            (KURA_PEERS, "https://kura-a.example.com"),
+            (KURA_DISCOVERY_DNS_NAME, "kura-ring.internal"),
+            (KURA_FILE_DESCRIPTOR_POOL_SIZE, "64"),
+            (KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS, "5000"),
+            (KURA_SEGMENT_HANDLE_CACHE_SIZE, "16"),
+            (KURA_MEMORY_SOFT_LIMIT_BYTES, "268435456"),
+            (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
+            (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
+            (KURA_MAX_KEYVALUE_BYTES, "1048576"),
+            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
+            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect("expected config overrides to parse");
+
+        assert_eq!(
+            config.discovery_dns_name.as_deref(),
+            Some("kura-ring.internal")
+        );
+    }
+
+    #[test]
     fn from_lookup_requires_segment_handle_cache_headroom() {
         let error = config_from(&[
             (KURA_PORT, "4000"),
+            (KURA_GRPC_PORT, "5000"),
             (KURA_TENANT_ID, "acme"),
             (KURA_REGION, "eu_west"),
             (KURA_TMP_DIR, "/tmp/kura"),
@@ -534,6 +596,7 @@ mod tests {
     fn from_lookup_requires_manifest_cache_to_leave_memory_headroom() {
         let error = config_from(&[
             (KURA_PORT, "4000"),
+            (KURA_GRPC_PORT, "5000"),
             (KURA_TENANT_ID, "acme"),
             (KURA_REGION, "eu_west"),
             (KURA_TMP_DIR, "/tmp/kura"),
@@ -567,6 +630,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let mut config = config_from(&[
             (KURA_PORT, "4000"),
+            (KURA_GRPC_PORT, "5000"),
             (KURA_TENANT_ID, "acme"),
             (KURA_REGION, "local"),
             (KURA_TMP_DIR, "/tmp/kura"),

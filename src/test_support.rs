@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::response::Response;
 use http_body_util::BodyExt;
@@ -23,12 +27,14 @@ where
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let mut config = Config {
         port: 0,
+        grpc_port: 0,
         tenant_id: "test-tenant".into(),
         region: "local".into(),
         tmp_dir: temp_dir.path().join("tmp"),
         data_dir: temp_dir.path().join("data"),
         node_url: "http://127.0.0.1:0".into(),
         peers: vec!["http://127.0.0.1:0".into()],
+        discovery_dns_name: None,
         file_descriptor_pool_size: 32,
         file_descriptor_acquire_timeout_ms: 5_000,
         segment_handle_cache_size: 8,
@@ -74,6 +80,8 @@ where
         client,
         notify: Notify::new(),
         members: RwLock::new(BTreeSet::new()),
+        peer_nodes: RwLock::new(BTreeMap::new()),
+        bootstrapped_peers: tokio::sync::Mutex::new(BTreeSet::new()),
     });
 
     TestContext {
