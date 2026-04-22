@@ -386,6 +386,10 @@ async fn discovery_targets(config: &Config) -> Vec<String> {
         return targets.into_iter().collect();
     };
     let scheme = node_url.scheme().to_owned();
+    if scheme == "https" {
+        targets.insert(format!("{scheme}://{dns_name}:{port}"));
+        return targets.into_iter().collect();
+    }
 
     match tokio::net::lookup_host((dns_name.as_str(), port)).await {
         Ok(addresses) => {
@@ -622,6 +626,24 @@ mod tests {
             .expect("outbox should load");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].1.target, "http://127.0.0.1:4101");
+    }
+
+    #[tokio::test]
+    async fn discover_targets_keeps_dns_names_for_https_peers() {
+        let ctx = test_context(|config| {
+            config.node_url = "https://kura-us.kura.internal:7443".into();
+            config.peers = vec!["https://seed.kura.internal:7443".into()];
+            config.discovery_dns_name = Some("kura-ring.kura.internal".into());
+        })
+        .await;
+
+        let targets: Vec<String> = discovery_targets(&ctx.state.config).await;
+
+        assert!(targets.contains(&"https://seed.kura.internal:7443".to_string()));
+        assert!(targets.contains(&"https://kura-ring.kura.internal:7443".to_string()));
+        assert!(!targets.iter().any(|target: &String| {
+            target.starts_with("https://127.") || target.starts_with("https://[::1]")
+        }));
     }
 
     #[tokio::test]

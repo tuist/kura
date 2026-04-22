@@ -24,7 +24,48 @@ use crate::{
     utils::{BodyReadError, module_key, read_request_to_temp},
 };
 
-pub fn router(state: SharedState) -> Router {
+pub fn public_router(state: SharedState) -> Router {
+    public_routes()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            apply_extensions,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_http_metrics,
+        ))
+        .with_state(state)
+}
+
+pub fn internal_router(state: SharedState) -> Router {
+    internal_routes()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_http_metrics,
+        ))
+        .with_state(state)
+}
+
+pub fn combined_router(state: SharedState) -> Router {
+    public_routes()
+        .merge(internal_routes())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            apply_extensions,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_http_metrics,
+        ))
+        .with_state(state)
+}
+
+#[cfg(test)]
+pub(crate) fn router(state: SharedState) -> Router {
+    combined_router(state)
+}
+
+fn public_routes() -> Router<SharedState> {
     Router::new()
         .route("/up", get(up))
         .route("/metrics", get(metrics_handler))
@@ -45,6 +86,10 @@ pub fn router(state: SharedState) -> Router {
             "/api/cache/gradle/{cache_key}",
             get(get_gradle).put(put_gradle),
         )
+}
+
+fn internal_routes() -> Router<SharedState> {
+    Router::new()
         .route("/_internal/status", get(internal_status))
         .route(
             "/_internal/bootstrap/manifests",
@@ -66,15 +111,6 @@ pub fn router(state: SharedState) -> Router {
             "/_internal/replicate/namespace",
             delete(internal_delete_namespace),
         )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            apply_extensions,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            track_http_metrics,
-        ))
-        .with_state(state)
 }
 
 const NX_NAMESPACE_ID: &str = "nx";

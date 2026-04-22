@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bazel-remote-apis = "0.27.0"
 bytes = "1.11.0"
@@ -22,6 +23,8 @@ prost = "0.14.1"
 prometheus-client = "0.24.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["http2", "json", "rustls-tls", "stream"] }
 rocksdb = { version = "0.24.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
+rustls = "0.23.35"
+rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
@@ -35,5 +38,6 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
 
 [dev-dependencies]
+rcgen = "0.14.5"
 tempfile = "3.23.0"
 tower = { version = "0.5.2", features = ["util"] }

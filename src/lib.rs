@@ -8,6 +8,7 @@ mod io;
 mod memory;
 mod metrics;
 mod multipart;
+mod peer_tls;
 mod reapi;
 mod replication;
 mod segment;

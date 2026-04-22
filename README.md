@@ -159,6 +159,99 @@ For multi-node deployments:
 - ensure every node can reach every other node's HTTP port
 - keep clocks reasonably in sync because replication and tombstones use version timestamps
 
+For peer-to-peer mTLS, additionally set:
+
+- `KURA_INTERNAL_PORT`
+- `KURA_INTERNAL_TLS_CA_CERT_PATH`
+- `KURA_INTERNAL_TLS_CERT_PATH`
+- `KURA_INTERNAL_TLS_KEY_PATH`
+
+When peer mTLS is enabled:
+
+- `KURA_NODE_URL` and every value in `KURA_PEERS` must use `https://...:<KURA_INTERNAL_PORT>`
+- the public API still stays on `KURA_PORT`
+- `/_internal/*` is only served on the internal mTLS listener
+- the certificate configured through `KURA_INTERNAL_TLS_CERT_PATH` should be valid for both server and client auth
+- the certificate SANs must cover the hostname used in `KURA_NODE_URL`
+
+## Helm on Kubernetes
+
+The repository includes a Helm chart at `ops/helm/kura` that deploys Kura as a `StatefulSet` with:
+
+- one PVC per pod for RocksDB state and segment storage
+- a headless service for stable pod DNS and peer discovery
+- a regular service exposing both HTTP and gRPC
+- optional ingress for the HTTP API
+- optional inline extension script mounting through a `ConfigMap`
+- optional peer mTLS for `/_internal/*` traffic via a mounted Kubernetes `Secret`
+
+Lint and render the chart:
+
+```bash
+helm lint ops/helm/kura
+helm template kura ops/helm/kura --namespace kura
+```
+
+Install it on a generic cluster:
+
+```bash
+helm upgrade --install kura ./ops/helm/kura \
+  --namespace kura \
+  --create-namespace \
+  --set image.repository=ghcr.io/tuist/kura \
+  --set image.tag=latest \
+  --set config.region=fr-par \
+  --set config.telemetry.otlpTracesEndpoint=http://otel-collector.monitoring.svc.cluster.local:4318/v1/traces
+```
+
+For a local kind smoke test, the repo includes:
+
+```bash
+./test/e2e/kura_helm_kind.sh
+```
+
+That script builds a local image, creates a kind cluster, installs the Helm chart, and verifies that an artifact written through one pod can be read from another pod.
+
+To enable peer mTLS in Kubernetes, set:
+
+- `peerTls.enabled=true`
+- `peerTls.internalPort=<port>`
+- `peerTls.secretName=<secret-with-ca-cert-and-key-material>`
+
+The referenced secret should contain the files configured by:
+
+- `peerTls.caCertFileName`
+- `peerTls.certFileName`
+- `peerTls.keyFileName`
+
+When enabled, the chart advertises peer URLs over `https` on the internal port and mounts the secret into `/etc/kura/peer-tls`.
+
+## Scaleway Kapsule
+
+For Scaleway, start from the bundled overrides in `ops/helm/kura/values-scaleway.yaml`:
+
+```bash
+helm upgrade --install kura ./ops/helm/kura \
+  --namespace kura \
+  --create-namespace \
+  -f ./ops/helm/kura/values-scaleway.yaml \
+  --set image.repository=ghcr.io/tuist/kura \
+  --set image.tag=latest \
+  --set config.region=fr-par \
+  --set config.telemetry.otlpTracesEndpoint=http://otel-collector.monitoring.svc.cluster.local:4318/v1/traces
+```
+
+That values file does two important things:
+
+- uses a `LoadBalancer` service, which is the simplest way to expose Kura on Kapsule
+- pins persistence to `scw-bssd`, which Scaleway documents as the default block storage class for Kapsule multi-AZ clusters
+
+Useful Scaleway references:
+
+- [Scaleway multi-AZ storage guidance](https://www.scaleway.com/en/docs/kubernetes/reference-content/multi-az-clusters/)
+- [Scaleway LoadBalancer annotations](https://www.scaleway.com/en/docs/kubernetes/reference-content/using-load-balancer-annotations/)
+- [Scaleway NGINX ingress with Kapsule](https://www.scaleway.com/en/docs/kubernetes/reference-content/lb-ingress-controller/)
+
 ## Extension Scripts
 
 Kura can load one operator-provided extension script at startup to customize authentication, authorization, and response headers without recompiling the binary.

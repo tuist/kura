@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::Client;
+use axum_server::Handle;
 use tokio::sync::{Notify, RwLock};
 use tracing::info;
 
@@ -17,6 +17,7 @@ use crate::{
     io::IoController,
     memory::MemoryController,
     metrics::Metrics,
+    peer_tls::{build_internal_rustls_config, build_peer_client},
     reapi,
     replication::{spawn_membership_task, spawn_outbox_task},
     state::AppState,
@@ -49,10 +50,7 @@ pub async fn run() -> Result<(), String> {
     );
     let store = Store::open(&config, io.clone(), memory.clone())?;
     let members = RwLock::new(BTreeSet::new());
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let client = build_peer_client(&config).await?;
     let notify = Notify::new();
 
     let state = Arc::new(AppState {
@@ -73,11 +71,14 @@ pub async fn run() -> Result<(), String> {
     spawn_outbox_task(state.clone());
     spawn_snapshot_task(state.clone());
 
-    let router = http::router(state.clone());
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.port));
     let grpc_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, state.config.grpc_port));
     info!("Kura service listening on {address}");
     info!("Kura REAPI service listening on {grpc_address}");
+    if let Some(peer_tls) = &state.config.peer_tls {
+        let internal_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, peer_tls.internal_port));
+        info!("Kura internal mTLS service listening on {internal_address}");
+    }
 
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -86,10 +87,11 @@ pub async fn run() -> Result<(), String> {
         .await
         .map_err(|error| format!("failed to bind gRPC listener: {error}"))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let grpc_shutdown_rx = shutdown_rx.clone();
     let grpc_state = state.clone();
     let grpc_handle = tokio::spawn(async move {
         let grpc_shutdown = async move {
-            let mut shutdown_rx = shutdown_rx;
+            let mut shutdown_rx = grpc_shutdown_rx;
             if *shutdown_rx.borrow() {
                 return;
             }
@@ -101,12 +103,49 @@ pub async fn run() -> Result<(), String> {
         }
     });
 
+    let internal_handle = if let Some(peer_tls) = state.config.peer_tls.clone() {
+        let tls_config = build_internal_rustls_config(&peer_tls).await?;
+        let internal_router = http::internal_router(state.clone());
+        let internal_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, peer_tls.internal_port));
+        let mut internal_shutdown_rx = shutdown_rx.clone();
+        let handle = Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            if *internal_shutdown_rx.borrow() {
+                shutdown_handle.graceful_shutdown(None);
+                return;
+            }
+            let _ = internal_shutdown_rx.changed().await;
+            shutdown_handle.graceful_shutdown(None);
+        });
+        Some(tokio::spawn(async move {
+            if let Err(error) = axum_server::bind_rustls(internal_address, tls_config)
+                .handle(handle)
+                .serve(internal_router.into_make_service())
+                .await
+            {
+                tracing::error!("internal mTLS server failed: {error}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    let router = if state.config.peer_tls.is_some() {
+        http::public_router(state.clone())
+    } else {
+        http::combined_router(state.clone())
+    };
+
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|error| format!("server error: {error}"))?;
     let _ = shutdown_tx.send(true);
     let _ = grpc_handle.await;
+    if let Some(internal_handle) = internal_handle {
+        let _ = internal_handle.await;
+    }
 
     if let Some(provider) = tracer_provider {
         if let Err(error) = provider.shutdown() {

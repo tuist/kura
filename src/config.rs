@@ -11,6 +11,10 @@ const KURA_DATA_DIR: &str = "KURA_DATA_DIR";
 const KURA_NODE_URL: &str = "KURA_NODE_URL";
 const KURA_PEERS: &str = "KURA_PEERS";
 const KURA_DISCOVERY_DNS_NAME: &str = "KURA_DISCOVERY_DNS_NAME";
+const KURA_INTERNAL_PORT: &str = "KURA_INTERNAL_PORT";
+const KURA_INTERNAL_TLS_CA_CERT_PATH: &str = "KURA_INTERNAL_TLS_CA_CERT_PATH";
+const KURA_INTERNAL_TLS_CERT_PATH: &str = "KURA_INTERNAL_TLS_CERT_PATH";
+const KURA_INTERNAL_TLS_KEY_PATH: &str = "KURA_INTERNAL_TLS_KEY_PATH";
 const KURA_FILE_DESCRIPTOR_POOL_SIZE: &str = "KURA_FILE_DESCRIPTOR_POOL_SIZE";
 const KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS: &str = "KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS";
 const KURA_SEGMENT_HANDLE_CACHE_SIZE: &str = "KURA_SEGMENT_HANDLE_CACHE_SIZE";
@@ -35,6 +39,7 @@ pub struct Config {
     pub node_url: String,
     pub peers: Vec<String>,
     pub discovery_dns_name: Option<String>,
+    pub peer_tls: Option<PeerTlsConfig>,
     pub file_descriptor_pool_size: usize,
     pub file_descriptor_acquire_timeout_ms: u64,
     pub segment_handle_cache_size: usize,
@@ -47,6 +52,14 @@ pub struct Config {
     pub otlp_traces_endpoint: String,
     pub otel_service_name: String,
     pub otel_deployment_environment: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerTlsConfig {
+    pub internal_port: u16,
+    pub ca_cert_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
 }
 
 impl Config {
@@ -86,17 +99,56 @@ impl Config {
         let tmp_dir = required_value(&mut lookup, KURA_TMP_DIR, &mut missing).map(PathBuf::from);
         let data_dir = required_value(&mut lookup, KURA_DATA_DIR, &mut missing).map(PathBuf::from);
         let node_url = required_value(&mut lookup, KURA_NODE_URL, &mut missing);
-        let peers = required_value(&mut lookup, KURA_PEERS, &mut missing).map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        });
+        let peers: Option<Vec<String>> =
+            required_value(&mut lookup, KURA_PEERS, &mut missing).map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            });
         let discovery_dns_name = lookup(KURA_DISCOVERY_DNS_NAME)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
+        let internal_port = lookup(KURA_INTERNAL_PORT)
+            .map(|value| {
+                value
+                    .parse::<u16>()
+                    .map_err(|_| format!("{KURA_INTERNAL_PORT} must be a valid u16"))
+            })
+            .transpose()?;
+        let internal_tls_ca_cert_path = lookup(KURA_INTERNAL_TLS_CA_CERT_PATH)
+            .map(PathBuf::from)
+            .filter(|value| !value.as_os_str().is_empty());
+        let internal_tls_cert_path = lookup(KURA_INTERNAL_TLS_CERT_PATH)
+            .map(PathBuf::from)
+            .filter(|value| !value.as_os_str().is_empty());
+        let internal_tls_key_path = lookup(KURA_INTERNAL_TLS_KEY_PATH)
+            .map(PathBuf::from)
+            .filter(|value| !value.as_os_str().is_empty());
+        let peer_tls = match (
+            internal_port,
+            internal_tls_ca_cert_path,
+            internal_tls_cert_path,
+            internal_tls_key_path,
+        ) {
+            (None, None, None, None) => None,
+            (Some(internal_port), Some(ca_cert_path), Some(cert_path), Some(key_path)) => {
+                Some(PeerTlsConfig {
+                    internal_port,
+                    ca_cert_path,
+                    cert_path,
+                    key_path,
+                })
+            }
+            _ => {
+                invalid.push(format!(
+                    "{KURA_INTERNAL_PORT}, {KURA_INTERNAL_TLS_CA_CERT_PATH}, {KURA_INTERNAL_TLS_CERT_PATH}, and {KURA_INTERNAL_TLS_KEY_PATH} must either all be set or all be unset"
+                ));
+                None
+            }
+        };
         let file_descriptor_pool_size =
             required_value(&mut lookup, KURA_FILE_DESCRIPTOR_POOL_SIZE, &mut missing).and_then(
                 |value| match value.parse::<usize>() {
@@ -296,6 +348,46 @@ impl Config {
         let otel_deployment_environment =
             required_value(&mut lookup, KURA_OTEL_DEPLOYMENT_ENVIRONMENT, &mut missing);
 
+        if let (Some(node_url), Some(peers), Some(peer_tls)) =
+            (node_url.as_ref(), peers.as_ref(), peer_tls.as_ref())
+        {
+            if let Some(port) = port {
+                if peer_tls.internal_port == port {
+                    invalid.push(format!(
+                        "{KURA_INTERNAL_PORT} must differ from {KURA_PORT} when peer mTLS is enabled"
+                    ));
+                }
+            }
+            match reqwest::Url::parse(node_url) {
+                Ok(url) => {
+                    let scheme = url.scheme();
+                    let port = url.port_or_known_default();
+                    if scheme != "https" {
+                        invalid.push(format!(
+                            "{KURA_NODE_URL} must use https when peer mTLS is enabled"
+                        ));
+                    }
+                    if port != Some(peer_tls.internal_port) {
+                        invalid.push(format!(
+                            "{KURA_NODE_URL} must target port {} when peer mTLS is enabled",
+                            peer_tls.internal_port
+                        ));
+                    }
+                }
+                Err(error) => invalid.push(format!("{KURA_NODE_URL} must be a valid URL: {error}")),
+            }
+
+            for peer in peers.iter().map(String::as_str) {
+                match reqwest::Url::parse(peer) {
+                    Ok(url) if url.scheme() == "https" => {}
+                    Ok(_) => invalid.push(format!(
+                        "peer URL {peer} must use https when peer mTLS is enabled"
+                    )),
+                    Err(error) => invalid.push(format!("peer URL {peer} must be valid: {error}")),
+                }
+            }
+        }
+
         if !missing.is_empty() || !invalid.is_empty() {
             let mut errors = Vec::new();
             if !missing.is_empty() {
@@ -318,6 +410,7 @@ impl Config {
             node_url: node_url.expect("node_url should be present when configuration is valid"),
             peers: peers.expect("peers should be present when configuration is valid"),
             discovery_dns_name,
+            peer_tls,
             file_descriptor_pool_size: file_descriptor_pool_size
                 .expect("file_descriptor_pool_size should be present when configuration is valid"),
             file_descriptor_acquire_timeout_ms: file_descriptor_acquire_timeout_ms.expect(
@@ -463,6 +556,7 @@ mod tests {
             ]
         );
         assert_eq!(config.discovery_dns_name, None);
+        assert_eq!(config.peer_tls, None);
         assert_eq!(config.file_descriptor_pool_size, 64);
         assert_eq!(config.file_descriptor_acquire_timeout_ms, 5000);
         assert_eq!(config.segment_handle_cache_size, 16);
@@ -623,6 +717,128 @@ mod tests {
 
         assert!(error.contains(KURA_MANIFEST_CACHE_MAX_BYTES));
         assert!(error.contains(KURA_MEMORY_SOFT_LIMIT_BYTES));
+    }
+
+    #[test]
+    fn from_lookup_parses_peer_tls_config() {
+        let config = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com:7443"),
+            (
+                KURA_PEERS,
+                "https://kura-a.example.com:7443, https://kura-b.example.com:7443",
+            ),
+            (KURA_INTERNAL_PORT, "7443"),
+            (KURA_INTERNAL_TLS_CA_CERT_PATH, "/etc/kura/peer-ca.pem"),
+            (KURA_INTERNAL_TLS_CERT_PATH, "/etc/kura/peer.pem"),
+            (KURA_INTERNAL_TLS_KEY_PATH, "/etc/kura/peer.key"),
+            (KURA_FILE_DESCRIPTOR_POOL_SIZE, "64"),
+            (KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS, "5000"),
+            (KURA_SEGMENT_HANDLE_CACHE_SIZE, "16"),
+            (KURA_MEMORY_SOFT_LIMIT_BYTES, "268435456"),
+            (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
+            (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
+            (KURA_MAX_KEYVALUE_BYTES, "1048576"),
+            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
+            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect("expected peer tls config to parse");
+
+        assert_eq!(
+            config.peer_tls,
+            Some(PeerTlsConfig {
+                internal_port: 7443,
+                ca_cert_path: PathBuf::from("/etc/kura/peer-ca.pem"),
+                cert_path: PathBuf::from("/etc/kura/peer.pem"),
+                key_path: PathBuf::from("/etc/kura/peer.key"),
+            })
+        );
+    }
+
+    #[test]
+    fn from_lookup_requires_complete_peer_tls_config() {
+        let error = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com:7443"),
+            (KURA_PEERS, "https://kura-a.example.com:7443"),
+            (KURA_INTERNAL_PORT, "7443"),
+            (KURA_INTERNAL_TLS_CA_CERT_PATH, "/etc/kura/peer-ca.pem"),
+            (KURA_FILE_DESCRIPTOR_POOL_SIZE, "64"),
+            (KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS, "5000"),
+            (KURA_SEGMENT_HANDLE_CACHE_SIZE, "16"),
+            (KURA_MEMORY_SOFT_LIMIT_BYTES, "268435456"),
+            (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
+            (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
+            (KURA_MAX_KEYVALUE_BYTES, "1048576"),
+            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
+            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect_err("expected incomplete peer tls config to fail");
+
+        assert!(error.contains(KURA_INTERNAL_PORT));
+        assert!(error.contains(KURA_INTERNAL_TLS_CA_CERT_PATH));
+        assert!(error.contains(KURA_INTERNAL_TLS_CERT_PATH));
+        assert!(error.contains(KURA_INTERNAL_TLS_KEY_PATH));
+    }
+
+    #[test]
+    fn from_lookup_requires_https_peer_urls_when_peer_tls_enabled() {
+        let error = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "http://kura.example.com:7443"),
+            (KURA_PEERS, "http://kura-a.example.com:7443"),
+            (KURA_INTERNAL_PORT, "7443"),
+            (KURA_INTERNAL_TLS_CA_CERT_PATH, "/etc/kura/peer-ca.pem"),
+            (KURA_INTERNAL_TLS_CERT_PATH, "/etc/kura/peer.pem"),
+            (KURA_INTERNAL_TLS_KEY_PATH, "/etc/kura/peer.key"),
+            (KURA_FILE_DESCRIPTOR_POOL_SIZE, "64"),
+            (KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS, "5000"),
+            (KURA_SEGMENT_HANDLE_CACHE_SIZE, "16"),
+            (KURA_MEMORY_SOFT_LIMIT_BYTES, "268435456"),
+            (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
+            (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
+            (KURA_MAX_KEYVALUE_BYTES, "1048576"),
+            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
+            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect_err("expected non-https peer urls to fail");
+
+        assert!(error.contains(KURA_NODE_URL));
+        assert!(error.contains("https"));
+        assert!(error.contains("peer URL"));
     }
 
     #[tokio::test]

@@ -1951,6 +1951,7 @@ mod tests {
             node_url: "http://127.0.0.1:0".into(),
             peers: vec!["http://127.0.0.1:0".into()],
             discovery_dns_name: None,
+            peer_tls: None,
             file_descriptor_pool_size: 32,
             file_descriptor_acquire_timeout_ms: 5_000,
             segment_handle_cache_size: 8,
