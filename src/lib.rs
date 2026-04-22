@@ -2,6 +2,7 @@ mod app;
 mod artifact;
 mod config;
 mod constants;
+mod extension;
 mod http;
 mod io;
 mod memory;

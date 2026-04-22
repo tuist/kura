@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::{
     config::Config,
+    extension::ExtensionEngine,
     http,
     io::IoController,
     memory::MemoryController,
@@ -33,6 +34,9 @@ pub async fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to create directories: {error}"))?;
 
     let metrics = Metrics::new(config.region.clone(), config.tenant_id.clone());
+    let extension = ExtensionEngine::from_env(metrics.clone())
+        .await
+        .map_err(|error| format!("failed to initialize extension engine: {error}"))?;
     let io = IoController::new(
         metrics.clone(),
         config.file_descriptor_pool_size,
@@ -57,6 +61,7 @@ pub async fn run() -> Result<(), String> {
         io,
         memory,
         metrics,
+        extension,
         client,
         notify,
         members,

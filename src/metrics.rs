@@ -62,6 +62,9 @@ pub struct Metrics {
     bootstrap_duration: Histogram,
     bootstrap_applied_items: Family<BootstrapItemLabels, Counter>,
     segment_generation_counts: Family<SegmentGenerationLabels, Gauge>,
+    extension_hooks: Family<ExtensionHookLabels, Counter>,
+    extension_hook_duration: Family<ExtensionHookRouteLabels, Histogram>,
+    extension_cache: Family<ExtensionCacheLabels, Counter>,
     process_resident_memory_bytes: Gauge,
     process_virtual_memory_bytes: Gauge,
     memory_pressure_state: Gauge,
@@ -134,6 +137,12 @@ impl Metrics {
         let bootstrap_duration = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         let bootstrap_applied_items = Family::<BootstrapItemLabels, Counter>::default();
         let segment_generation_counts = Family::<SegmentGenerationLabels, Gauge>::default();
+        let extension_hooks = Family::<ExtensionHookLabels, Counter>::default();
+        let extension_hook_duration =
+            Family::<ExtensionHookRouteLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.0005, 2.0, 16))
+            });
+        let extension_cache = Family::<ExtensionCacheLabels, Counter>::default();
         let process_resident_memory_bytes = Gauge::default();
         let process_virtual_memory_bytes = Gauge::default();
         let memory_pressure_state = Gauge::default();
@@ -362,6 +371,21 @@ impl Metrics {
             segment_generation_counts.clone(),
         );
         registry.register(
+            "kura_extension_hooks_total",
+            "Extension hook invocations by hook and result",
+            extension_hooks.clone(),
+        );
+        registry.register(
+            "kura_extension_hook_duration_seconds",
+            "Extension hook execution latency by hook",
+            extension_hook_duration.clone(),
+        );
+        registry.register(
+            "kura_extension_cache_total",
+            "Extension cache lookups by cache and result",
+            extension_cache.clone(),
+        );
+        registry.register(
             "kura_process_resident_memory_bytes",
             "Process resident memory size in bytes",
             process_resident_memory_bytes.clone(),
@@ -451,6 +475,9 @@ impl Metrics {
             bootstrap_duration,
             bootstrap_applied_items,
             segment_generation_counts,
+            extension_hooks,
+            extension_hook_duration,
+            extension_cache,
             process_resident_memory_bytes,
             process_virtual_memory_bytes,
             memory_pressure_state,
@@ -777,6 +804,29 @@ impl Metrics {
             .set(count as i64);
     }
 
+    pub fn record_extension_hook(&self, hook: &str, result: &str, duration: Duration) {
+        self.extension_hooks
+            .get_or_create(&ExtensionHookLabels {
+                hook: hook.to_owned(),
+                result: result.to_owned(),
+            })
+            .inc();
+        self.extension_hook_duration
+            .get_or_create(&ExtensionHookRouteLabels {
+                hook: hook.to_owned(),
+            })
+            .observe(duration.as_secs_f64());
+    }
+
+    pub fn record_extension_cache(&self, cache: &str, result: &str) {
+        self.extension_cache
+            .get_or_create(&ExtensionCacheLabels {
+                cache: cache.to_owned(),
+                result: result.to_owned(),
+            })
+            .inc();
+    }
+
     pub fn update_process_memory(&self, resident_bytes: u64, virtual_bytes: u64) {
         self.process_resident_memory_bytes
             .set(resident_bytes as i64);
@@ -932,6 +982,23 @@ struct SegmentHandleEvictionLabels {
 struct SegmentGenerationLabels {
     kind: String,
     generation: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ExtensionHookLabels {
+    hook: String,
+    result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ExtensionHookRouteLabels {
+    hook: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ExtensionCacheLabels {
+    cache: String,
+    result: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]

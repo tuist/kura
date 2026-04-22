@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::{
     Json, Router,
@@ -16,6 +16,7 @@ use tracing::{Instrument, field};
 use crate::{
     artifact::{kind::ArtifactKind, manifest::ArtifactManifest},
     constants::{MAX_GRADLE_BYTES, MAX_MODULE_PART_BYTES, MAX_MODULE_TOTAL_BYTES, MAX_XCODE_BYTES},
+    extension::{AccessDecision, ExtensionContext},
     multipart::error::MultipartError,
     replication::replication_targets,
     state::SharedState,
@@ -65,6 +66,10 @@ pub fn router(state: SharedState) -> Router {
             "/_internal/replicate/namespace",
             delete(internal_delete_namespace),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            apply_extensions,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_http_metrics,
@@ -273,6 +278,306 @@ async fn track_http_metrics(
         .record_http(route, method, response.status(), start.elapsed());
 
     response
+}
+
+async fn apply_extensions(State(state): State<SharedState>, req: Request, next: Next) -> Response {
+    let Some(extension) = state.extension.as_ref() else {
+        return next.run(req).await;
+    };
+
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = req.uri().path().to_owned();
+    if should_skip_extension_route(&route) {
+        return next.run(req).await;
+    }
+
+    let method = req.method().to_string();
+    let query = parse_query_map(req.uri().query());
+    let request_headers = header_map_to_btree(req.headers());
+    let context = extension_context_from_http(
+        &state,
+        &route,
+        &method,
+        &path,
+        &query,
+        &request_headers,
+        None,
+    )
+    .await;
+
+    let principal = match extension.evaluate_access(&context).await {
+        AccessDecision::Allow(principal) => principal,
+        AccessDecision::Deny(deny) => {
+            return error_response(status_from_u16(deny.status), deny.message);
+        }
+    };
+
+    let mut response = next.run(req).await;
+
+    let response_context = extension_context_from_http(
+        &state,
+        &route,
+        &method,
+        &path,
+        &query,
+        &request_headers,
+        Some(response.status().as_u16()),
+    )
+    .await;
+    let headers = extension
+        .response_headers(&response_context, principal.as_ref())
+        .await;
+    for (name, value) in headers.headers {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::header::HeaderName::try_from(name),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+
+    response
+}
+
+fn should_skip_extension_route(route: &str) -> bool {
+    route == "/up" || route == "/metrics" || route.starts_with("/_internal/")
+}
+
+async fn extension_context_from_http(
+    state: &SharedState,
+    route: &str,
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    headers: &BTreeMap<String, String>,
+    status_code: Option<u16>,
+) -> ExtensionContext {
+    let metadata = http_extension_metadata(state, route, method, path, query).await;
+    ExtensionContext {
+        transport: "http".into(),
+        route: route.to_owned(),
+        method: method.to_owned(),
+        operation: metadata.operation,
+        tenant_id: metadata.tenant_id,
+        namespace_id: metadata.namespace_id,
+        client: metadata.client,
+        artifact_class: metadata.artifact_class,
+        artifact_key: metadata.artifact_key,
+        artifact_hash: metadata.artifact_hash,
+        headers: headers.clone(),
+        query: query
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        status_code,
+    }
+}
+
+struct HttpExtensionMetadata {
+    operation: String,
+    tenant_id: Option<String>,
+    namespace_id: Option<String>,
+    client: Option<String>,
+    artifact_class: Option<String>,
+    artifact_key: Option<String>,
+    artifact_hash: Option<String>,
+}
+
+async fn http_extension_metadata(
+    state: &SharedState,
+    route: &str,
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+) -> HttpExtensionMetadata {
+    let tenant_id = query.get("tenant_id").cloned();
+    let mut namespace_id = query.get("namespace_id").cloned();
+    let last_path_segment = path.rsplit('/').next().map(str::to_owned);
+
+    match route {
+        "/api/cache/keyvalue/{cas_id}" => HttpExtensionMetadata {
+            operation: "artifact.read".into(),
+            tenant_id,
+            namespace_id,
+            client: Some("generic".into()),
+            artifact_class: Some("action_cache".into()),
+            artifact_key: last_path_segment,
+            artifact_hash: None,
+        },
+        "/api/cache/keyvalue" => HttpExtensionMetadata {
+            operation: "artifact.write".into(),
+            tenant_id,
+            namespace_id,
+            client: Some("generic".into()),
+            artifact_class: Some("action_cache".into()),
+            artifact_key: query.get("cas_id").cloned(),
+            artifact_hash: None,
+        },
+        "/api/cache/cas/{id}" => HttpExtensionMetadata {
+            operation: if method.eq_ignore_ascii_case("GET") {
+                "artifact.read"
+            } else {
+                "artifact.write"
+            }
+            .into(),
+            tenant_id,
+            namespace_id,
+            client: Some("xcode".into()),
+            artifact_class: Some("blob".into()),
+            artifact_key: last_path_segment.clone(),
+            artifact_hash: last_path_segment.clone(),
+        },
+        "/api/cache/gradle/{cache_key}" => HttpExtensionMetadata {
+            operation: if method.eq_ignore_ascii_case("GET") {
+                "artifact.read"
+            } else {
+                "artifact.write"
+            }
+            .into(),
+            tenant_id,
+            namespace_id,
+            client: Some("gradle".into()),
+            artifact_class: Some("blob".into()),
+            artifact_key: last_path_segment.clone(),
+            artifact_hash: last_path_segment.clone(),
+        },
+        "/api/cache/module/{id}" => HttpExtensionMetadata {
+            operation: if method.eq_ignore_ascii_case("HEAD") || method.eq_ignore_ascii_case("GET")
+            {
+                "artifact.read"
+            } else {
+                "artifact.write"
+            }
+            .into(),
+            tenant_id,
+            namespace_id,
+            client: Some("module".into()),
+            artifact_class: Some("blob".into()),
+            artifact_key: Some(module_key_from_query(query)),
+            artifact_hash: query.get("hash").cloned(),
+        },
+        "/api/cache/module/start" | "/api/cache/module/part" | "/api/cache/module/complete" => {
+            let multipart_upload = query
+                .get("upload_id")
+                .and_then(|upload_id| state.store.multipart_upload(upload_id).ok().flatten());
+            let tenant_id =
+                tenant_id.or_else(|| multipart_upload.as_ref().map(|u| u.tenant_id.clone()));
+            let namespace_id =
+                namespace_id.or_else(|| multipart_upload.as_ref().map(|u| u.namespace_id.clone()));
+            let artifact_key = multipart_upload
+                .as_ref()
+                .map(|upload| module_key(&upload.category, &upload.hash, &upload.name))
+                .or_else(|| Some(module_key_from_query(query)));
+            let artifact_hash = query
+                .get("hash")
+                .cloned()
+                .or_else(|| multipart_upload.map(|u| u.hash));
+
+            HttpExtensionMetadata {
+                operation: "artifact.write".into(),
+                tenant_id,
+                namespace_id,
+                client: Some("module".into()),
+                artifact_class: Some("blob".into()),
+                artifact_key,
+                artifact_hash,
+            }
+        }
+        "/api/cache/clean" => HttpExtensionMetadata {
+            operation: "namespace.delete".into(),
+            tenant_id,
+            namespace_id,
+            client: None,
+            artifact_class: None,
+            artifact_key: None,
+            artifact_hash: None,
+        },
+        "/v1/cache/{hash}" => {
+            namespace_id = Some(NX_NAMESPACE_ID.into());
+            HttpExtensionMetadata {
+                operation: if method.eq_ignore_ascii_case("GET") {
+                    "artifact.read"
+                } else {
+                    "artifact.write"
+                }
+                .into(),
+                tenant_id: Some("default".into()),
+                namespace_id,
+                client: Some("nx".into()),
+                artifact_class: Some("blob".into()),
+                artifact_key: last_path_segment.clone(),
+                artifact_hash: last_path_segment,
+            }
+        }
+        "/api/metro/cache/{cache_key}" => {
+            namespace_id = Some(METRO_NAMESPACE_ID.into());
+            HttpExtensionMetadata {
+                operation: if method.eq_ignore_ascii_case("GET") {
+                    "artifact.read"
+                } else {
+                    "artifact.write"
+                }
+                .into(),
+                tenant_id: Some("default".into()),
+                namespace_id,
+                client: Some("metro".into()),
+                artifact_class: Some("blob".into()),
+                artifact_key: last_path_segment.clone(),
+                artifact_hash: last_path_segment,
+            }
+        }
+        _ => HttpExtensionMetadata {
+            operation: "request".into(),
+            tenant_id,
+            namespace_id,
+            client: None,
+            artifact_class: None,
+            artifact_key: None,
+            artifact_hash: None,
+        },
+    }
+}
+
+fn module_key_from_query(query: &HashMap<String, String>) -> String {
+    let category = query
+        .get("cache_category")
+        .cloned()
+        .unwrap_or_else(|| "builds".into());
+    let hash = query.get("hash").cloned().unwrap_or_default();
+    let name = query.get("name").cloned().unwrap_or_default();
+    module_key(&category, &hash, &name)
+}
+
+fn parse_query_map(query: Option<&str>) -> HashMap<String, String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect()
+}
+
+fn header_map_to_btree(headers: &axum::http::HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
+}
+
+fn status_from_u16(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn up(State(state): State<SharedState>) -> impl IntoResponse {
@@ -1243,6 +1548,37 @@ mod tests {
             .expect("get request failed");
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(response_text(get).await, "part-one-part-two");
+    }
+
+    #[tokio::test]
+    async fn extension_context_resolves_namespace_from_multipart_upload() {
+        let context = test_context(|_| {}).await;
+        let upload_id = context
+            .state
+            .store
+            .start_multipart_upload("acme", "ios", "builds", "hash-1", "Module.framework")
+            .expect("failed to start multipart upload");
+        let query = parse_query_map(Some(&format!("upload_id={upload_id}&part_number=1")));
+        let headers = BTreeMap::new();
+
+        let extension_context = extension_context_from_http(
+            &context.state,
+            "/api/cache/module/part",
+            "POST",
+            "/api/cache/module/part",
+            &query,
+            &headers,
+            None,
+        )
+        .await;
+
+        assert_eq!(extension_context.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(extension_context.namespace_id.as_deref(), Some("ios"));
+        assert_eq!(extension_context.artifact_hash.as_deref(), Some("hash-1"));
+        assert_eq!(
+            extension_context.artifact_key.as_deref(),
+            Some("builds/hash-1/Module.framework")
+        );
     }
 
     #[tokio::test]

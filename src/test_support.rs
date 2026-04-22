@@ -11,8 +11,8 @@ use tempfile::TempDir;
 use tokio::sync::{Notify, RwLock};
 
 use crate::{
-    config::Config, io::IoController, memory::MemoryController, metrics::Metrics, state::AppState,
-    store::Store,
+    config::Config, extension::SharedExtension, io::IoController, memory::MemoryController,
+    metrics::Metrics, state::AppState, store::Store,
 };
 
 pub(crate) struct TestContext {
@@ -21,6 +21,16 @@ pub(crate) struct TestContext {
 }
 
 pub(crate) async fn test_context<F>(override_config: F) -> TestContext
+where
+    F: FnOnce(&mut Config),
+{
+    test_context_with_extension(override_config, None).await
+}
+
+pub(crate) async fn test_context_with_extension<F>(
+    override_config: F,
+    extension: Option<SharedExtension>,
+) -> TestContext
 where
     F: FnOnce(&mut Config),
 {
@@ -77,6 +87,7 @@ where
         io,
         memory,
         metrics,
+        extension,
         client,
         notify: Notify::new(),
         members: RwLock::new(BTreeSet::new()),
