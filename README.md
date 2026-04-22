@@ -73,14 +73,14 @@ Important runtime configuration:
 - `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
 - `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
 - `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
-- `KURA_ROCKSDB_MAX_OPEN_FILES` controls RocksDB's own SST/WAL descriptor budget
-- `KURA_ROCKSDB_MAX_BACKGROUND_JOBS` controls RocksDB flush and compaction concurrency
-- `KURA_ROCKSDB_BLOCK_CACHE_BYTES` caps RocksDB's block cache so index and SST warming do not grow RSS without bound
-- `KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES` caps total RocksDB memtable memory across column families
-- `KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES` controls the size of each memtable before flush
-- `KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER` controls how many memtables each column family may keep in memory
+- `KURA_METADATA_STORE_MAX_OPEN_FILES` controls the metadata store's own descriptor budget
+- `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` controls metadata-store flush and compaction concurrency
+- `KURA_METADATA_STORE_READ_CACHE_BYTES` caps the metadata store's read cache so hot metadata lookups do not grow RSS without bound
+- `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` caps total memory reserved for metadata write buffering
+- `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` controls the size of each metadata write buffer before flush
+- `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` controls how many metadata write buffers may stay in memory at once
 
-Prometheus also exposes the live RocksDB memory gauges:
+Prometheus also exposes live metadata-store memory gauges:
 
 - `kura_rocksdb_block_cache_usage_bytes`
 - `kura_rocksdb_block_cache_pinned_usage_bytes`
@@ -103,14 +103,15 @@ Kura is easier to read by subsystem than by tutorial step. The sections below gr
 
 Kura exposes multiple cache protocols behind one service:
 
+The following HTTP surfaces are Tuist-specific client protocols. They exist so Tuist clients can talk to Kura without changing their cache behavior:
+
 - 🍎 `Xcode CAS`: `POST/GET /api/cache/cas/{id}?tenant_id=...&namespace_id=...`
 - 🗂️ `Keyvalue / action-cache style entries`: `PUT /api/cache/keyvalue?tenant_id=...&namespace_id=...`
 - 🐘 `Gradle`: `PUT/GET /api/cache/gradle/{cache_key}?tenant_id=...&namespace_id=...`
-- 📦 `Multipart module cache uploads`:
-  - `POST /api/cache/module/start?...`
-  - `POST /api/cache/module/part?...`
-  - `POST /api/cache/module/complete?...`
-  - `HEAD/GET /api/cache/module/{id}?...`
+- 📦 `Multipart module cache uploads`: `POST /api/cache/module/start?...`, `POST /api/cache/module/part?...`, `POST /api/cache/module/complete?...`, `HEAD/GET /api/cache/module/{id}?...`
+
+Kura also exposes broader ecosystem protocols that are not specific to Tuist:
+
 - 🧱 `Nx`: `PUT/GET /v1/cache/{hash}`
 - 📱 `Metro`: `PUT/GET /api/metro/cache/{cache_key}`
 - 🛠️ `Bazel` and `Buck2`: REAPI over gRPC on `KURA_GRPC_PORT`
@@ -145,13 +146,6 @@ curl \
   "http://localhost:4103/api/cache/keyvalue/cas-1?tenant_id=acme&namespace_id=ios"
 ```
 
-References:
-
-- `src/http.rs`
-- `src/reapi/mod.rs`
-- `spec/e2e/cluster_spec.sh`
-- `spec/e2e/clients_spec.sh`
-
 ## 🗄️ Storage And Replication
 
 Kura splits storage into two planes:
@@ -181,14 +175,6 @@ When peer mTLS is enabled:
 - 🪪 the certificate configured through `KURA_INTERNAL_TLS_CERT_PATH` should be valid for both server and client auth
 - 🏷️ the certificate SANs must cover the hostname used in `KURA_NODE_URL`
 
-References:
-
-- `src/store.rs`
-- `src/replication/`
-- `src/peer_tls.rs`
-- `spec/e2e/discovery_spec.sh`
-- `spec/e2e/mtls_spec.sh`
-
 ## ⚙️ Runtime Model And Limits
 
 Kura is designed around explicit resource budgets instead of relying on ambient process limits.
@@ -202,12 +188,12 @@ Important runtime configuration:
 - 🚫 `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
 - 🗂️ `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
 - 📏 `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
-- 🪨 `KURA_ROCKSDB_MAX_OPEN_FILES` controls RocksDB's own SST/WAL descriptor budget
-- 🛠️ `KURA_ROCKSDB_MAX_BACKGROUND_JOBS` controls RocksDB flush and compaction concurrency
-- 📚 `KURA_ROCKSDB_BLOCK_CACHE_BYTES` caps RocksDB's block cache so index and SST warming do not grow RSS without bound
-- 🧮 `KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES` caps total RocksDB memtable memory across column families
-- 🧱 `KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES` controls the size of each memtable before flush
-- 🔢 `KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER` controls how many memtables each column family may keep in memory
+- 🪨 `KURA_METADATA_STORE_MAX_OPEN_FILES` controls the metadata store's own descriptor budget
+- 🛠️ `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` controls metadata-store flush and compaction concurrency
+- 📚 `KURA_METADATA_STORE_READ_CACHE_BYTES` caps the metadata store's read cache so hot metadata lookups do not grow RSS without bound
+- 🧮 `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` caps total memory reserved for metadata write buffering
+- 🧱 `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` controls the size of each metadata write buffer before flush
+- 🔢 `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` controls how many metadata write buffers may stay in memory at once
 
 A minimal direct-binary deployment still looks like:
 
@@ -227,23 +213,17 @@ KURA_MEMORY_SOFT_LIMIT_BYTES=536870912 \
 KURA_MEMORY_HARD_LIMIT_BYTES=805306368 \
 KURA_MANIFEST_CACHE_MAX_BYTES=67108864 \
 KURA_MAX_KEYVALUE_BYTES=1048576 \
-KURA_ROCKSDB_MAX_OPEN_FILES=1024 \
-KURA_ROCKSDB_MAX_BACKGROUND_JOBS=4 \
-KURA_ROCKSDB_BLOCK_CACHE_BYTES=67108864 \
-KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES=67108864 \
-KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES=16777216 \
-KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER=4 \
+KURA_METADATA_STORE_MAX_OPEN_FILES=1024 \
+KURA_METADATA_STORE_MAX_BACKGROUND_JOBS=4 \
+KURA_METADATA_STORE_READ_CACHE_BYTES=67108864 \
+KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES=67108864 \
+KURA_METADATA_STORE_WRITE_BUFFER_BYTES=16777216 \
+KURA_METADATA_STORE_MAX_WRITE_BUFFERS=4 \
 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces \
 KURA_OTEL_SERVICE_NAME=kura-eu-central \
 KURA_OTEL_DEPLOYMENT_ENVIRONMENT=production \
 ./target/release/kura
 ```
-
-References:
-
-- `src/config.rs`
-- `src/memory/`
-- `src/io/`
 
 ## 📊 Observability And Analytics
 
@@ -254,7 +234,7 @@ Kura ships with a fairly complete local observability story:
 - 🪵 Loki and Promtail logs
 - 🧭 Tempo traces
 
-Prometheus exposes the live RocksDB memory gauges:
+Prometheus exposes live metadata-store memory gauges:
 
 - `kura_rocksdb_block_cache_usage_bytes`
 - `kura_rocksdb_block_cache_pinned_usage_bytes`
@@ -292,19 +272,13 @@ Configure it with:
 - optional `KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD` default `5`
 - optional `KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS` default `30000`
 
-References:
-
-- `src/metrics.rs`
-- `src/analytics.rs`
-- `ops/grafana/`
-
 ## ☸️ Deployment Options
 
 ### Helm And Kubernetes
 
 The repository includes a Helm chart at `ops/helm/kura` that deploys Kura as a `StatefulSet` with:
 
-- 💾 one PVC per pod for RocksDB state and segment storage
+- 💾 one PVC per pod for metadata-state and segment storage
 - 🧭 a headless service for stable pod DNS and peer discovery
 - 🌐 a regular service exposing both HTTP and gRPC
 - 🚪 optional ingress for the HTTP API
@@ -370,12 +344,6 @@ That values file does two important things:
 - 🚪 uses a `LoadBalancer` service, which is the simplest way to expose Kura on Kapsule
 - 💾 pins persistence to `scw-bssd`, which Scaleway documents as the default block storage class for Kapsule multi-AZ clusters
 
-References:
-
-- `ops/helm/kura`
-- `ops/helm/kura/values-scaleway.yaml`
-- `test/e2e/kura_helm_kind.sh`
-
 ## 🧩 Extensions And Policy
 
 Kura can load one operator-provided extension script at startup to customize authentication, authorization, and response headers without recompiling the binary.
@@ -414,11 +382,6 @@ The script may define these hooks:
 
 The runtime keeps decision caching, metrics, timeouts, and cryptographic primitives in Rust, while the script supplies policy.
 
-References:
-
-- `src/extension/`
-- `spec/e2e/extension_spec.sh`
-
 <a id="reference"></a>
 ## 📖 Reference
 
@@ -435,16 +398,16 @@ Important runtime configuration:
 - `KURA_MEMORY_HARD_LIMIT_BYTES` marks the point where Kura pauses outbox replication and trims hot caches aggressively
 - `KURA_MANIFEST_CACHE_MAX_BYTES` caps the in-memory manifest hot cache and must stay below the soft memory limit so cache warming does not consume the whole heap
 - `KURA_MAX_KEYVALUE_BYTES` bounds per-request keyvalue payload memory on both public and replication APIs
-- `KURA_ROCKSDB_MAX_OPEN_FILES` controls RocksDB's own SST/WAL descriptor budget
-- `KURA_ROCKSDB_MAX_BACKGROUND_JOBS` controls RocksDB flush and compaction concurrency
-- `KURA_ROCKSDB_BLOCK_CACHE_BYTES` caps RocksDB's block cache so index and SST warming do not grow RSS without bound
-- `KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES` caps total RocksDB memtable memory across column families
-- `KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES` controls the size of each memtable before flush
-- `KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER` controls how many memtables each column family may keep in memory
+- `KURA_METADATA_STORE_MAX_OPEN_FILES` controls the metadata store's own descriptor budget
+- `KURA_METADATA_STORE_MAX_BACKGROUND_JOBS` controls metadata-store flush and compaction concurrency
+- `KURA_METADATA_STORE_READ_CACHE_BYTES` caps the metadata store's read cache so hot metadata lookups do not grow RSS without bound
+- `KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES` caps total memory reserved for metadata write buffering
+- `KURA_METADATA_STORE_WRITE_BUFFER_BYTES` controls the size of each metadata write buffer before flush
+- `KURA_METADATA_STORE_MAX_WRITE_BUFFERS` controls how many metadata write buffers may stay in memory at once
 
 ### 📊 Metrics reference
 
-Prometheus exposes the live RocksDB memory gauges:
+Prometheus exposes live metadata-store memory gauges:
 
 - `kura_rocksdb_block_cache_usage_bytes`
 - `kura_rocksdb_block_cache_pinned_usage_bytes`

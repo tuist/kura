@@ -101,10 +101,10 @@ spec:
               value: {{ printf "%d" (int64 .Values.config.memory.manifestCacheMaxBytes) | quote }}
             - name: KURA_MAX_KEYVALUE_BYTES
               value: {{ printf "%d" (int64 .Values.config.memory.maxKeyvalueBytes) | quote }}
-            - name: KURA_ROCKSDB_MAX_OPEN_FILES
-              value: {{ printf "%d" (int .Values.config.rocksdb.maxOpenFiles) | quote }}
-            - name: KURA_ROCKSDB_MAX_BACKGROUND_JOBS
-              value: {{ printf "%d" (int .Values.config.rocksdb.maxBackgroundJobs) | quote }}
+            - name: KURA_METADATA_STORE_MAX_OPEN_FILES
+              value: {{ printf "%d" (int .Values.config.metadataStore.maxOpenFiles) | quote }}
+            - name: KURA_METADATA_STORE_MAX_BACKGROUND_JOBS
+              value: {{ printf "%d" (int .Values.config.metadataStore.maxBackgroundJobs) | quote }}
             - name: KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
               value: {{ .Values.config.telemetry.otlpTracesEndpoint | quote }}
             - name: KURA_OTEL_SERVICE_NAME

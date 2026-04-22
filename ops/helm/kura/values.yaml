@@ -84,7 +84,7 @@ config:
     hardLimitBytes: 805306368
     manifestCacheMaxBytes: 67108864
     maxKeyvalueBytes: 1048576
-  rocksdb:
+  metadataStore:
     maxOpenFiles: 1024
     maxBackgroundJobs: 4
   telemetry:

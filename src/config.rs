@@ -22,12 +22,13 @@ const KURA_MEMORY_SOFT_LIMIT_BYTES: &str = "KURA_MEMORY_SOFT_LIMIT_BYTES";
 const KURA_MEMORY_HARD_LIMIT_BYTES: &str = "KURA_MEMORY_HARD_LIMIT_BYTES";
 const KURA_MANIFEST_CACHE_MAX_BYTES: &str = "KURA_MANIFEST_CACHE_MAX_BYTES";
 const KURA_MAX_KEYVALUE_BYTES: &str = "KURA_MAX_KEYVALUE_BYTES";
-const KURA_ROCKSDB_MAX_OPEN_FILES: &str = "KURA_ROCKSDB_MAX_OPEN_FILES";
-const KURA_ROCKSDB_MAX_BACKGROUND_JOBS: &str = "KURA_ROCKSDB_MAX_BACKGROUND_JOBS";
-const KURA_ROCKSDB_BLOCK_CACHE_BYTES: &str = "KURA_ROCKSDB_BLOCK_CACHE_BYTES";
-const KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES: &str = "KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES";
-const KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES: &str = "KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES";
-const KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER: &str = "KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER";
+const KURA_METADATA_STORE_MAX_OPEN_FILES: &str = "KURA_METADATA_STORE_MAX_OPEN_FILES";
+const KURA_METADATA_STORE_MAX_BACKGROUND_JOBS: &str = "KURA_METADATA_STORE_MAX_BACKGROUND_JOBS";
+const KURA_METADATA_STORE_READ_CACHE_BYTES: &str = "KURA_METADATA_STORE_READ_CACHE_BYTES";
+const KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES: &str =
+    "KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES";
+const KURA_METADATA_STORE_WRITE_BUFFER_BYTES: &str = "KURA_METADATA_STORE_WRITE_BUFFER_BYTES";
+const KURA_METADATA_STORE_MAX_WRITE_BUFFERS: &str = "KURA_METADATA_STORE_MAX_WRITE_BUFFERS";
 const KURA_ANALYTICS_SERVER_URL: &str = "KURA_ANALYTICS_SERVER_URL";
 const KURA_ANALYTICS_SIGNING_KEY: &str = "KURA_ANALYTICS_SIGNING_KEY";
 const KURA_ANALYTICS_BATCH_SIZE: &str = "KURA_ANALYTICS_BATCH_SIZE";
@@ -332,108 +333,114 @@ impl Config {
                     None
                 }
             });
-        let rocksdb_max_open_files =
-            required_value(&mut lookup, KURA_ROCKSDB_MAX_OPEN_FILES, &mut missing).and_then(
-                |value| match value.parse::<i32>() {
-                    Ok(max_open_files) if max_open_files > 0 || max_open_files == -1 => {
-                        Some(max_open_files)
-                    }
-                    Ok(_) => {
-                        invalid.push(format!(
-                            "{KURA_ROCKSDB_MAX_OPEN_FILES} must be -1 or greater than 0"
-                        ));
-                        None
-                    }
-                    Err(_) => {
-                        invalid.push(format!("{KURA_ROCKSDB_MAX_OPEN_FILES} must be a valid i32"));
-                        None
-                    }
-                },
-            );
-        let rocksdb_max_background_jobs =
-            required_value(&mut lookup, KURA_ROCKSDB_MAX_BACKGROUND_JOBS, &mut missing).and_then(
-                |value| match value.parse::<i32>() {
-                    Ok(max_background_jobs) if max_background_jobs > 0 => Some(max_background_jobs),
-                    Ok(_) => {
-                        invalid.push(format!(
-                            "{KURA_ROCKSDB_MAX_BACKGROUND_JOBS} must be greater than 0"
-                        ));
-                        None
-                    }
-                    Err(_) => {
-                        invalid.push(format!(
-                            "{KURA_ROCKSDB_MAX_BACKGROUND_JOBS} must be a valid i32"
-                        ));
-                        None
-                    }
-                },
-            );
+        let rocksdb_max_open_files = required_value(
+            &mut lookup,
+            KURA_METADATA_STORE_MAX_OPEN_FILES,
+            &mut missing,
+        )
+        .and_then(|value| match value.parse::<i32>() {
+            Ok(max_open_files) if max_open_files > 0 || max_open_files == -1 => {
+                Some(max_open_files)
+            }
+            Ok(_) => {
+                invalid.push(format!(
+                    "{KURA_METADATA_STORE_MAX_OPEN_FILES} must be -1 or greater than 0"
+                ));
+                None
+            }
+            Err(_) => {
+                invalid.push(format!(
+                    "{KURA_METADATA_STORE_MAX_OPEN_FILES} must be a valid i32"
+                ));
+                None
+            }
+        });
+        let rocksdb_max_background_jobs = required_value(
+            &mut lookup,
+            KURA_METADATA_STORE_MAX_BACKGROUND_JOBS,
+            &mut missing,
+        )
+        .and_then(|value| match value.parse::<i32>() {
+            Ok(max_background_jobs) if max_background_jobs > 0 => Some(max_background_jobs),
+            Ok(_) => {
+                invalid.push(format!(
+                    "{KURA_METADATA_STORE_MAX_BACKGROUND_JOBS} must be greater than 0"
+                ));
+                None
+            }
+            Err(_) => {
+                invalid.push(format!(
+                    "{KURA_METADATA_STORE_MAX_BACKGROUND_JOBS} must be a valid i32"
+                ));
+                None
+            }
+        });
         let rocksdb_block_cache_bytes = optional_parsed_value(
             &mut lookup,
-            KURA_ROCKSDB_BLOCK_CACHE_BYTES,
+            KURA_METADATA_STORE_READ_CACHE_BYTES,
             &mut invalid,
             |value| {
-                value
-                    .parse::<usize>()
-                    .map_err(|_| format!("{KURA_ROCKSDB_BLOCK_CACHE_BYTES} must be a valid usize"))
+                value.parse::<usize>().map_err(|_| {
+                    format!("{KURA_METADATA_STORE_READ_CACHE_BYTES} must be a valid usize")
+                })
             },
         )
         .unwrap_or(64 * 1024 * 1024);
         if rocksdb_block_cache_bytes == 0 {
             invalid.push(format!(
-                "{KURA_ROCKSDB_BLOCK_CACHE_BYTES} must be greater than 0"
+                "{KURA_METADATA_STORE_READ_CACHE_BYTES} must be greater than 0"
             ));
         }
         let rocksdb_write_buffer_manager_bytes = optional_parsed_value(
             &mut lookup,
-            KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES,
+            KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES,
             &mut invalid,
             |value| {
                 value.parse::<usize>().map_err(|_| {
-                    format!("{KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES} must be a valid usize")
+                    format!("{KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES} must be a valid usize")
                 })
             },
         )
         .unwrap_or(64 * 1024 * 1024);
         if rocksdb_write_buffer_manager_bytes == 0 {
             invalid.push(format!(
-                "{KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES} must be greater than 0"
+                "{KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES} must be greater than 0"
             ));
         }
         let rocksdb_write_buffer_size_bytes = optional_parsed_value(
             &mut lookup,
-            KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES,
+            KURA_METADATA_STORE_WRITE_BUFFER_BYTES,
             &mut invalid,
             |value| {
                 value.parse::<usize>().map_err(|_| {
-                    format!("{KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES} must be a valid usize")
+                    format!("{KURA_METADATA_STORE_WRITE_BUFFER_BYTES} must be a valid usize")
                 })
             },
         )
         .unwrap_or(16 * 1024 * 1024);
         if rocksdb_write_buffer_size_bytes == 0 {
             invalid.push(format!(
-                "{KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES} must be greater than 0"
+                "{KURA_METADATA_STORE_WRITE_BUFFER_BYTES} must be greater than 0"
             ));
         } else if rocksdb_write_buffer_size_bytes > rocksdb_write_buffer_manager_bytes {
             invalid.push(format!(
-                "{KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES} must be less than or equal to {KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES}"
+                "{KURA_METADATA_STORE_WRITE_BUFFER_BYTES} must be less than or equal to {KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES}"
             ));
         }
         let rocksdb_max_write_buffer_number = optional_parsed_value(
             &mut lookup,
-            KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER,
+            KURA_METADATA_STORE_MAX_WRITE_BUFFERS,
             &mut invalid,
             |value| {
                 value.parse::<i32>().map_err(|_| {
-                    format!("{KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER} must be a valid i32")
+                    format!("{KURA_METADATA_STORE_MAX_WRITE_BUFFERS} must be a valid i32")
                 })
             },
         )
         .unwrap_or(4);
         if rocksdb_max_write_buffer_number <= 0 {
             invalid.push(format!(
-                "{KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER} must be greater than 0"
+                "{KURA_METADATA_STORE_MAX_WRITE_BUFFERS} must be greater than 0"
             ));
         }
         let analytics_server_url = lookup(KURA_ANALYTICS_SERVER_URL)
@@ -755,8 +762,8 @@ mod tests {
         assert!(error.contains(KURA_MEMORY_HARD_LIMIT_BYTES));
         assert!(error.contains(KURA_MANIFEST_CACHE_MAX_BYTES));
         assert!(error.contains(KURA_MAX_KEYVALUE_BYTES));
-        assert!(error.contains(KURA_ROCKSDB_MAX_OPEN_FILES));
-        assert!(error.contains(KURA_ROCKSDB_MAX_BACKGROUND_JOBS));
+        assert!(error.contains(KURA_METADATA_STORE_MAX_OPEN_FILES));
+        assert!(error.contains(KURA_METADATA_STORE_MAX_BACKGROUND_JOBS));
         assert!(error.contains(KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT));
         assert!(error.contains(KURA_OTEL_SERVICE_NAME));
         assert!(error.contains(KURA_OTEL_DEPLOYMENT_ENVIRONMENT));
@@ -783,8 +790,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -850,12 +857,12 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "invalid"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "invalid"),
             (KURA_MAX_KEYVALUE_BYTES, "invalid"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "invalid"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "invalid"),
-            (KURA_ROCKSDB_BLOCK_CACHE_BYTES, "invalid"),
-            (KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES, "invalid"),
-            (KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES, "invalid"),
-            (KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER, "invalid"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "invalid"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "invalid"),
+            (KURA_METADATA_STORE_READ_CACHE_BYTES, "invalid"),
+            (KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES, "invalid"),
+            (KURA_METADATA_STORE_WRITE_BUFFER_BYTES, "invalid"),
+            (KURA_METADATA_STORE_MAX_WRITE_BUFFERS, "invalid"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -875,12 +882,12 @@ mod tests {
         assert!(error.contains(KURA_MEMORY_HARD_LIMIT_BYTES));
         assert!(error.contains(KURA_MANIFEST_CACHE_MAX_BYTES));
         assert!(error.contains(KURA_MAX_KEYVALUE_BYTES));
-        assert!(error.contains(KURA_ROCKSDB_MAX_OPEN_FILES));
-        assert!(error.contains(KURA_ROCKSDB_MAX_BACKGROUND_JOBS));
-        assert!(error.contains(KURA_ROCKSDB_BLOCK_CACHE_BYTES));
-        assert!(error.contains(KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES));
-        assert!(error.contains(KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES));
-        assert!(error.contains(KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER));
+        assert!(error.contains(KURA_METADATA_STORE_MAX_OPEN_FILES));
+        assert!(error.contains(KURA_METADATA_STORE_MAX_BACKGROUND_JOBS));
+        assert!(error.contains(KURA_METADATA_STORE_READ_CACHE_BYTES));
+        assert!(error.contains(KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES));
+        assert!(error.contains(KURA_METADATA_STORE_WRITE_BUFFER_BYTES));
+        assert!(error.contains(KURA_METADATA_STORE_MAX_WRITE_BUFFERS));
     }
 
     #[test]
@@ -902,8 +909,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -937,12 +944,12 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
-            (KURA_ROCKSDB_BLOCK_CACHE_BYTES, "33554432"),
-            (KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES, "50331648"),
-            (KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES, "8388608"),
-            (KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER, "6"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_READ_CACHE_BYTES, "33554432"),
+            (KURA_METADATA_STORE_WRITE_BUFFER_POOL_BYTES, "50331648"),
+            (KURA_METADATA_STORE_WRITE_BUFFER_BYTES, "8388608"),
+            (KURA_METADATA_STORE_MAX_WRITE_BUFFERS, "6"),
             (KURA_ANALYTICS_SERVER_URL, "https://tuist.dev/"),
             (KURA_ANALYTICS_SIGNING_KEY, "secret-key"),
             (KURA_ANALYTICS_BATCH_SIZE, "25"),
@@ -997,8 +1004,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
             (KURA_ANALYTICS_SERVER_URL, "https://tuist.dev"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
@@ -1031,8 +1038,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "128"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "2"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "128"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "2"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -1064,8 +1071,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "2097152"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "1048576"),
             (KURA_MAX_KEYVALUE_BYTES, "262144"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "128"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "2"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "128"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "2"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -1104,8 +1111,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -1146,8 +1153,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -1185,8 +1192,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "1024"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "4"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -1220,8 +1227,8 @@ mod tests {
             (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
             (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
             (KURA_MAX_KEYVALUE_BYTES, "1048576"),
-            (KURA_ROCKSDB_MAX_OPEN_FILES, "256"),
-            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "2"),
+            (KURA_METADATA_STORE_MAX_OPEN_FILES, "256"),
+            (KURA_METADATA_STORE_MAX_BACKGROUND_JOBS, "2"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "http://127.0.0.1:4318/v1/traces",
