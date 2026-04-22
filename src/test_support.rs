@@ -11,8 +11,8 @@ use tempfile::TempDir;
 use tokio::sync::{Notify, RwLock};
 
 use crate::{
-    config::Config, extension::SharedExtension, io::IoController, memory::MemoryController,
-    metrics::Metrics, state::AppState, store::Store,
+    analytics::Analytics, config::Config, extension::SharedExtension, io::IoController,
+    memory::MemoryController, metrics::Metrics, state::AppState, store::Store,
 };
 
 pub(crate) struct TestContext {
@@ -55,6 +55,11 @@ where
         max_keyvalue_bytes: 512 * 1024,
         rocksdb_max_open_files: 256,
         rocksdb_max_background_jobs: 2,
+        rocksdb_block_cache_bytes: 32 * 1024 * 1024,
+        rocksdb_write_buffer_manager_bytes: 32 * 1024 * 1024,
+        rocksdb_write_buffer_size_bytes: 8 * 1024 * 1024,
+        rocksdb_max_write_buffer_number: 4,
+        analytics: None,
         otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
         otel_service_name: "kura-test".into(),
         otel_deployment_environment: "test".into(),
@@ -78,6 +83,9 @@ where
     );
     let store =
         Store::open(&config, io.clone(), memory.clone()).expect("failed to open test store");
+    let analytics =
+        Analytics::from_config(config.analytics.as_ref(), &config.node_url, metrics.clone())
+            .expect("failed to build test analytics");
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -89,6 +97,7 @@ where
         memory,
         metrics,
         extension,
+        analytics,
         client,
         notify: Notify::new(),
         members: RwLock::new(BTreeSet::new()),

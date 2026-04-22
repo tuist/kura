@@ -130,10 +130,8 @@ pub fn spawn_outbox_task(state: SharedState) {
             state
                 .metrics
                 .update_background_work_paused("outbox", pause_outbox);
-            if !pause_outbox {
-                if let Err(error) = process_outbox(&state).await {
-                    warn!("outbox processing failed: {error}");
-                }
+            if !pause_outbox && let Err(error) = process_outbox(&state).await {
+                warn!("outbox processing failed: {error}");
             }
 
             tokio::select! {
@@ -419,7 +417,8 @@ struct BootstrapStats {
 }
 
 pub async fn process_outbox(state: &SharedState) -> Result<(), String> {
-    for (message_key, message) in state.store.outbox_messages()? {
+    let mut after = None::<Vec<u8>>;
+    while let Some((message_key, message)) = state.store.next_outbox_message(after.as_deref())? {
         let started_at = std::time::Instant::now();
         let operation_name = message.operation.name();
         let result = replicate_message(state, &message).await;
@@ -444,6 +443,7 @@ pub async fn process_outbox(state: &SharedState) -> Result<(), String> {
                 warn!("replication to {} failed: {error}", message.target);
             }
         }
+        after = Some(message_key);
     }
 
     Ok(())

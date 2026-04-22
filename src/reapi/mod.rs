@@ -44,6 +44,17 @@ pub struct ReapiService {
     state: SharedState,
 }
 
+#[derive(Clone)]
+struct GrpcExtensionSpec<'a> {
+    route: &'a str,
+    operation: &'a str,
+    namespace_id: Option<&'a str>,
+    client: Option<&'a str>,
+    artifact_class: Option<&'a str>,
+    artifact_key: Option<String>,
+    artifact_hash: Option<String>,
+}
+
 pub async fn serve<F>(listener: TcpListener, state: SharedState, shutdown: F) -> Result<(), String>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -69,28 +80,12 @@ impl ReapiService {
     async fn authorize_request<T>(
         &self,
         request: &Request<T>,
-        route: &str,
-        operation: &str,
-        namespace_id: Option<&str>,
-        client: Option<&str>,
-        artifact_class: Option<&str>,
-        artifact_key: Option<String>,
-        artifact_hash: Option<String>,
+        spec: GrpcExtensionSpec<'_>,
     ) -> Result<Option<Principal>, Status> {
         let Some(extension) = self.state.extension.as_ref() else {
             return Ok(None);
         };
-        let context = grpc_extension_context(
-            route,
-            operation,
-            namespace_id,
-            client,
-            artifact_class,
-            artifact_key,
-            artifact_hash,
-            request.metadata(),
-            None,
-        );
+        let context = grpc_extension_context(&spec, request.metadata(), None);
         match extension.evaluate_access(&context).await {
             AccessDecision::Allow(principal) => Ok(principal),
             AccessDecision::Deny(deny) => {
@@ -102,29 +97,13 @@ impl ReapiService {
     async fn apply_response_headers<T>(
         &self,
         response: &mut Response<T>,
-        route: &str,
-        operation: &str,
-        namespace_id: Option<&str>,
-        client: Option<&str>,
-        artifact_class: Option<&str>,
-        artifact_key: Option<String>,
-        artifact_hash: Option<String>,
+        spec: GrpcExtensionSpec<'_>,
         principal: Option<&Principal>,
     ) -> Result<(), Status> {
         let Some(extension) = self.state.extension.as_ref() else {
             return Ok(());
         };
-        let context = grpc_extension_context(
-            route,
-            operation,
-            namespace_id,
-            client,
-            artifact_class,
-            artifact_key,
-            artifact_hash,
-            response.metadata(),
-            Some(200),
-        );
+        let context = grpc_extension_context(&spec, response.metadata(), Some(200));
         let headers = extension.response_headers(&context, principal).await;
         for (name, value) in headers.headers {
             let metadata_key = tonic::metadata::MetadataKey::from_bytes(name.as_bytes())
@@ -143,18 +122,16 @@ impl Capabilities for ReapiService {
         &self,
         request: Request<reapi::GetCapabilitiesRequest>,
     ) -> Result<Response<reapi::ServerCapabilities>, Status> {
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.capabilities.get",
-                "capabilities.read",
-                None,
-                Some("reapi"),
-                None,
-                None,
-                None,
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.capabilities.get",
+            operation: "capabilities.read",
+            namespace_id: None,
+            client: Some("reapi"),
+            artifact_class: None,
+            artifact_key: None,
+            artifact_hash: None,
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         let mut response = Response::new(reapi::ServerCapabilities {
             cache_capabilities: Some(reapi::CacheCapabilities {
                 digest_functions: vec![reapi::digest_function::Value::Sha256 as i32],
@@ -187,18 +164,8 @@ impl Capabilities for ReapiService {
                 prerelease: String::new(),
             }),
         });
-        self.apply_response_headers(
-            &mut response,
-            "reapi.capabilities.get",
-            "capabilities.read",
-            None,
-            Some("reapi"),
-            None,
-            None,
-            None,
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
         Ok(response)
     }
 }
@@ -217,19 +184,17 @@ impl ActionCache for ReapiService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("missing action_digest"))?;
         let key = digest_key(digest)?;
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.action_cache.get",
-                "artifact.read",
-                Some(namespace_id),
-                Some("reapi"),
-                Some("action_cache"),
-                Some(key.clone()),
-                Some(digest.hash.clone()),
-            )
-            .await?;
-        let mut action_result = fetch_keyvalue_proto::<reapi::ActionResult>(
+        let extension = GrpcExtensionSpec {
+            route: "reapi.action_cache.get",
+            operation: "artifact.read",
+            namespace_id: Some(namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("action_cache"),
+            artifact_key: Some(key.clone()),
+            artifact_hash: Some(digest.hash.clone()),
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
+        let (manifest, mut action_result) = fetch_keyvalue_proto::<reapi::ActionResult>(
             &self.state,
             namespace_id,
             &key,
@@ -237,29 +202,23 @@ impl ActionCache for ReapiService {
         )
         .await?;
 
-        if request.get_ref().inline_stdout {
-            if action_result.stdout_raw.is_empty() {
-                if let Some(digest) = &action_result.stdout_digest {
-                    if let Some(bytes) = maybe_read_cas_bytes(&self.state, namespace_id, digest)
-                        .await
-                        .map_err(Status::internal)?
-                    {
-                        action_result.stdout_raw = bytes;
-                    }
-                }
-            }
+        if request.get_ref().inline_stdout
+            && action_result.stdout_raw.is_empty()
+            && let Some(digest) = &action_result.stdout_digest
+            && let Some(bytes) = maybe_read_cas_bytes(&self.state, namespace_id, digest)
+                .await
+                .map_err(Status::internal)?
+        {
+            action_result.stdout_raw = bytes;
         }
-        if request.get_ref().inline_stderr {
-            if action_result.stderr_raw.is_empty() {
-                if let Some(digest) = &action_result.stderr_digest {
-                    if let Some(bytes) = maybe_read_cas_bytes(&self.state, namespace_id, digest)
-                        .await
-                        .map_err(Status::internal)?
-                    {
-                        action_result.stderr_raw = bytes;
-                    }
-                }
-            }
+        if request.get_ref().inline_stderr
+            && action_result.stderr_raw.is_empty()
+            && let Some(digest) = &action_result.stderr_digest
+            && let Some(bytes) = maybe_read_cas_bytes(&self.state, namespace_id, digest)
+                .await
+                .map_err(Status::internal)?
+        {
+            action_result.stderr_raw = bytes;
         }
         if !request.get_ref().inline_output_files.is_empty() {
             for output_file in &mut action_result.output_files {
@@ -271,32 +230,23 @@ impl ActionCache for ReapiService {
                 {
                     continue;
                 }
-                if output_file.contents.is_empty() {
-                    if let Some(digest) = &output_file.digest {
-                        if let Some(bytes) = maybe_read_cas_bytes(&self.state, namespace_id, digest)
-                            .await
-                            .map_err(Status::internal)?
-                        {
-                            output_file.contents = bytes;
-                        }
-                    }
+                if output_file.contents.is_empty()
+                    && let Some(digest) = &output_file.digest
+                    && let Some(bytes) = maybe_read_cas_bytes(&self.state, namespace_id, digest)
+                        .await
+                        .map_err(Status::internal)?
+                {
+                    output_file.contents = bytes;
                 }
             }
         }
 
         let mut response = Response::new(action_result);
-        self.apply_response_headers(
-            &mut response,
-            "reapi.action_cache.get",
-            "artifact.read",
-            Some(namespace_id),
-            Some("reapi"),
-            Some("action_cache"),
-            Some(key),
-            Some(digest.hash.clone()),
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
+        self.state
+            .metrics
+            .record_artifact_read(ArtifactKind::Keyvalue, "ok", manifest.size);
         Ok(response)
     }
 
@@ -317,18 +267,16 @@ impl ActionCache for ReapiService {
             .clone()
             .ok_or_else(|| Status::invalid_argument("missing action_result"))?;
         let key = digest_key(digest)?;
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.action_cache.update",
-                "artifact.write",
-                Some(namespace_id),
-                Some("reapi"),
-                Some("action_cache"),
-                Some(key.clone()),
-                Some(digest.hash.clone()),
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.action_cache.update",
+            operation: "artifact.write",
+            namespace_id: Some(namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("action_cache"),
+            artifact_key: Some(key.clone()),
+            artifact_hash: Some(digest.hash.clone()),
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         let bytes = action_result.encode_to_vec();
         let targets = replication_targets(&self.state).await;
         let manifest = self
@@ -349,18 +297,8 @@ impl ActionCache for ReapiService {
             .metrics
             .record_artifact_write(ArtifactKind::Keyvalue, "ok", manifest.size);
         let mut response = Response::new(action_result);
-        self.apply_response_headers(
-            &mut response,
-            "reapi.action_cache.update",
-            "artifact.write",
-            Some(namespace_id),
-            Some("reapi"),
-            Some("action_cache"),
-            Some(key),
-            Some(digest.hash.clone()),
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
         Ok(response)
     }
 }
@@ -376,18 +314,16 @@ impl ContentAddressableStorage for ReapiService {
     ) -> Result<Response<reapi::FindMissingBlobsResponse>, Status> {
         require_sha256(request.get_ref().digest_function)?;
         let namespace_id = namespace_from_instance(&request.get_ref().instance_name);
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.cas.find_missing",
-                "artifact.inspect",
-                Some(namespace_id),
-                Some("reapi"),
-                Some("blob"),
-                None,
-                None,
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.cas.find_missing",
+            operation: "artifact.inspect",
+            namespace_id: Some(namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("blob"),
+            artifact_key: None,
+            artifact_hash: None,
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         let mut missing = Vec::new();
         for digest in &request.get_ref().blob_digests {
             let key = digest_key(digest)?;
@@ -407,18 +343,8 @@ impl ContentAddressableStorage for ReapiService {
         let mut response = Response::new(reapi::FindMissingBlobsResponse {
             missing_blob_digests: missing,
         });
-        self.apply_response_headers(
-            &mut response,
-            "reapi.cas.find_missing",
-            "artifact.inspect",
-            Some(namespace_id),
-            Some("reapi"),
-            Some("blob"),
-            None,
-            None,
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
         Ok(response)
     }
 
@@ -428,18 +354,16 @@ impl ContentAddressableStorage for ReapiService {
     ) -> Result<Response<reapi::BatchUpdateBlobsResponse>, Status> {
         require_sha256(request.get_ref().digest_function)?;
         let namespace_id = namespace_from_instance(&request.get_ref().instance_name);
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.cas.batch_update",
-                "artifact.write",
-                Some(namespace_id),
-                Some("reapi"),
-                Some("blob"),
-                None,
-                None,
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.cas.batch_update",
+            operation: "artifact.write",
+            namespace_id: Some(namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("blob"),
+            artifact_key: None,
+            artifact_hash: None,
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         let mut responses = Vec::with_capacity(request.get_ref().requests.len());
 
         for item in &request.get_ref().requests {
@@ -473,18 +397,8 @@ impl ContentAddressableStorage for ReapiService {
         }
 
         let mut response = Response::new(reapi::BatchUpdateBlobsResponse { responses });
-        self.apply_response_headers(
-            &mut response,
-            "reapi.cas.batch_update",
-            "artifact.write",
-            Some(namespace_id),
-            Some("reapi"),
-            Some("blob"),
-            None,
-            None,
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
         Ok(response)
     }
 
@@ -494,18 +408,16 @@ impl ContentAddressableStorage for ReapiService {
     ) -> Result<Response<reapi::BatchReadBlobsResponse>, Status> {
         require_sha256(request.get_ref().digest_function)?;
         let namespace_id = namespace_from_instance(&request.get_ref().instance_name);
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.cas.batch_read",
-                "artifact.read",
-                Some(namespace_id),
-                Some("reapi"),
-                Some("blob"),
-                None,
-                None,
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.cas.batch_read",
+            operation: "artifact.read",
+            namespace_id: Some(namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("blob"),
+            artifact_key: None,
+            artifact_hash: None,
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         let mut responses = Vec::with_capacity(request.get_ref().digests.len());
 
         for digest in &request.get_ref().digests {
@@ -533,18 +445,8 @@ impl ContentAddressableStorage for ReapiService {
         }
 
         let mut response = Response::new(reapi::BatchReadBlobsResponse { responses });
-        self.apply_response_headers(
-            &mut response,
-            "reapi.cas.batch_read",
-            "artifact.read",
-            Some(namespace_id),
-            Some("reapi"),
-            Some("blob"),
-            None,
-            None,
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
         Ok(response)
     }
 
@@ -580,31 +482,44 @@ impl ByteStream for ReapiService {
         request: Request<bytestream::ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         let resource = parse_read_resource_name(&request.get_ref().resource_name)?;
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.bytestream.read",
-                "artifact.read",
-                Some(&resource.namespace_id),
-                Some("reapi"),
-                Some("blob"),
-                Some(resource.key.clone()),
-                Some(resource.hash.clone()),
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.bytestream.read",
+            operation: "artifact.read",
+            namespace_id: Some(&resource.namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("blob"),
+            artifact_key: Some(resource.key.clone()),
+            artifact_hash: Some(resource.hash.clone()),
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         if request.get_ref().read_offset < 0 {
             return Err(Status::invalid_argument("read_offset must be non-negative"));
         }
         if request.get_ref().read_limit < 0 {
             return Err(Status::invalid_argument("read_limit must be non-negative"));
         }
-        let manifest = self
+        let manifest = match self
             .state
             .store
             .fetch_artifact(ArtifactKind::Module, &resource.namespace_id, &resource.key)
             .await
-            .map_err(|error| Status::internal(format!("failed to read CAS blob: {error}")))?
-            .ok_or_else(|| Status::not_found("blob not found"))?;
+        {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                self.state
+                    .metrics
+                    .record_artifact_read(ArtifactKind::Module, "not_found", 0);
+                return Err(Status::not_found("blob not found"));
+            }
+            Err(error) => {
+                self.state
+                    .metrics
+                    .record_artifact_read(ArtifactKind::Module, "error", 0);
+                return Err(Status::internal(format!(
+                    "failed to read CAS blob: {error}"
+                )));
+            }
+        };
         let read_offset = request.get_ref().read_offset as u64;
         if read_offset > manifest.size {
             return Err(Status::out_of_range("read_offset exceeds blob size"));
@@ -614,12 +529,23 @@ impl ByteStream for ReapiService {
         } else {
             Some(request.get_ref().read_limit as u64)
         };
+        let bytes_to_read = read_limit
+            .unwrap_or_else(|| manifest.size.saturating_sub(read_offset))
+            .min(manifest.size.saturating_sub(read_offset));
         let reader = self
             .state
             .store
             .open_artifact_reader_range(&manifest, read_offset, read_limit)
             .await
-            .map_err(|error| Status::internal(format!("failed to stream blob: {error}")))?;
+            .map_err(|error| {
+                self.state
+                    .metrics
+                    .record_artifact_read(ArtifactKind::Module, "error", 0);
+                Status::internal(format!("failed to stream blob: {error}"))
+            })?;
+        self.state
+            .metrics
+            .record_artifact_read(ArtifactKind::Module, "ok", bytes_to_read);
         let stream = ReaderStream::new(reader).map(|result| match result {
             Ok(bytes) => Ok(bytestream::ReadResponse {
                 data: bytes.to_vec(),
@@ -630,18 +556,8 @@ impl ByteStream for ReapiService {
         });
 
         let mut response = Response::new(Box::pin(stream) as Self::ReadStream);
-        self.apply_response_headers(
-            &mut response,
-            "reapi.bytestream.read",
-            "artifact.read",
-            Some(&resource.namespace_id),
-            Some("reapi"),
-            Some("blob"),
-            Some(resource.key),
-            Some(resource.hash),
-            principal.as_ref(),
-        )
-        .await?;
+        self.apply_response_headers(&mut response, extension, principal.as_ref())
+            .await?;
         Ok(response)
     }
 
@@ -649,18 +565,16 @@ impl ByteStream for ReapiService {
         &self,
         request: Request<tonic::Streaming<bytestream::WriteRequest>>,
     ) -> Result<Response<bytestream::WriteResponse>, Status> {
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.bytestream.write",
-                "artifact.write",
-                None,
-                Some("reapi"),
-                Some("blob"),
-                None,
-                None,
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.bytestream.write",
+            operation: "artifact.write",
+            namespace_id: None,
+            client: Some("reapi"),
+            artifact_class: Some("blob"),
+            artifact_key: None,
+            artifact_hash: None,
+        };
+        let principal = self.authorize_request(&request, extension).await?;
         let temp_path = temp_file_path(&self.state.config.tmp_dir.join("uploads"), "reapi-write");
         if let Some(parent) = temp_path.parent() {
             self.state
@@ -772,13 +686,15 @@ impl ByteStream for ReapiService {
         });
         self.apply_response_headers(
             &mut response,
-            "reapi.bytestream.write",
-            "artifact.write",
-            Some(&resource.namespace_id),
-            Some("reapi"),
-            Some("blob"),
-            Some(resource.key),
-            Some(resource.hash),
+            GrpcExtensionSpec {
+                route: "reapi.bytestream.write",
+                operation: "artifact.write",
+                namespace_id: Some(&resource.namespace_id),
+                client: Some("reapi"),
+                artifact_class: Some("blob"),
+                artifact_key: Some(resource.key),
+                artifact_hash: Some(resource.hash),
+            },
             principal.as_ref(),
         )
         .await?;
@@ -790,18 +706,16 @@ impl ByteStream for ReapiService {
         request: Request<bytestream::QueryWriteStatusRequest>,
     ) -> Result<Response<bytestream::QueryWriteStatusResponse>, Status> {
         let resource = parse_write_resource_name(&request.get_ref().resource_name)?;
-        let principal = self
-            .authorize_request(
-                &request,
-                "reapi.bytestream.query_write_status",
-                "artifact.inspect",
-                Some(&resource.namespace_id),
-                Some("reapi"),
-                Some("blob"),
-                Some(resource.key.clone()),
-                Some(resource.hash.clone()),
-            )
-            .await?;
+        let extension = GrpcExtensionSpec {
+            route: "reapi.bytestream.query_write_status",
+            operation: "artifact.inspect",
+            namespace_id: Some(&resource.namespace_id),
+            client: Some("reapi"),
+            artifact_class: Some("blob"),
+            artifact_key: Some(resource.key.clone()),
+            artifact_hash: Some(resource.hash.clone()),
+        };
+        let principal = self.authorize_request(&request, extension.clone()).await?;
         let manifest = self
             .state
             .store
@@ -815,18 +729,8 @@ impl ByteStream for ReapiService {
                     committed_size: manifest.size as i64,
                     complete: true,
                 });
-                self.apply_response_headers(
-                    &mut response,
-                    "reapi.bytestream.query_write_status",
-                    "artifact.inspect",
-                    Some(&resource.namespace_id),
-                    Some("reapi"),
-                    Some("blob"),
-                    Some(resource.key),
-                    Some(resource.hash),
-                    principal.as_ref(),
-                )
-                .await?;
+                self.apply_response_headers(&mut response, extension, principal.as_ref())
+                    .await?;
                 Ok(response)
             }
             None => Err(Status::not_found("blob not found")),
@@ -839,21 +743,44 @@ async fn fetch_keyvalue_proto<T>(
     namespace_id: &str,
     key: &str,
     label: &str,
-) -> Result<T, Status>
+) -> Result<(ArtifactManifest, T), Status>
 where
     T: Message + Default,
 {
-    let manifest = state
+    let manifest = match state
         .store
         .fetch_artifact(ArtifactKind::Keyvalue, namespace_id, key)
         .await
-        .map_err(|error| Status::internal(format!("failed to load {label}: {error}")))?
-        .ok_or_else(|| Status::not_found(format!("{label} not found")))?;
+    {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            state
+                .metrics
+                .record_artifact_read(ArtifactKind::Keyvalue, "not_found", 0);
+            return Err(Status::not_found(format!("{label} not found")));
+        }
+        Err(error) => {
+            state
+                .metrics
+                .record_artifact_read(ArtifactKind::Keyvalue, "error", 0);
+            return Err(Status::internal(format!("failed to load {label}: {error}")));
+        }
+    };
     let bytes = read_manifest_bytes(state, &manifest)
         .await
-        .map_err(|error| Status::internal(format!("failed to read {label}: {error}")))?;
-    T::decode(bytes.as_slice())
-        .map_err(|error| Status::internal(format!("failed to decode {label}: {error}")))
+        .map_err(|error| {
+            state
+                .metrics
+                .record_artifact_read(ArtifactKind::Keyvalue, "error", 0);
+            Status::internal(format!("failed to read {label}: {error}"))
+        })?;
+    let decoded = T::decode(bytes.as_slice()).map_err(|error| {
+        state
+            .metrics
+            .record_artifact_read(ArtifactKind::Keyvalue, "error", 0);
+        Status::internal(format!("failed to decode {label}: {error}"))
+    })?;
+    Ok((manifest, decoded))
 }
 
 async fn maybe_read_cas_bytes(
@@ -865,11 +792,29 @@ async fn maybe_read_cas_bytes(
     let Some(manifest) = state
         .store
         .fetch_artifact(ArtifactKind::Module, namespace_id, &key)
-        .await?
+        .await
+        .inspect_err(|_| {
+            state
+                .metrics
+                .record_artifact_read(ArtifactKind::Module, "error", 0);
+        })?
     else {
+        state
+            .metrics
+            .record_artifact_read(ArtifactKind::Module, "not_found", 0);
         return Ok(None);
     };
-    read_manifest_bytes(state, &manifest).await.map(Some)
+    let bytes = read_manifest_bytes(state, &manifest)
+        .await
+        .inspect_err(|_| {
+            state
+                .metrics
+                .record_artifact_read(ArtifactKind::Module, "error", 0);
+        })?;
+    state
+        .metrics
+        .record_artifact_read(ArtifactKind::Module, "ok", bytes.len() as u64);
+    Ok(Some(bytes))
 }
 
 async fn persist_cas_blob(
@@ -962,27 +907,21 @@ fn rpc_status(code: i32, message: impl Into<String>) -> RpcStatus {
 }
 
 fn grpc_extension_context(
-    route: &str,
-    operation: &str,
-    namespace_id: Option<&str>,
-    client: Option<&str>,
-    artifact_class: Option<&str>,
-    artifact_key: Option<String>,
-    artifact_hash: Option<String>,
+    spec: &GrpcExtensionSpec<'_>,
     metadata: &tonic::metadata::MetadataMap,
     status_code: Option<u16>,
 ) -> ExtensionContext {
     ExtensionContext {
         transport: "grpc".into(),
-        route: route.to_owned(),
+        route: spec.route.to_owned(),
         method: "RPC".into(),
-        operation: operation.to_owned(),
+        operation: spec.operation.to_owned(),
         tenant_id: None,
-        namespace_id: namespace_id.map(ToOwned::to_owned),
-        client: client.map(ToOwned::to_owned),
-        artifact_class: artifact_class.map(ToOwned::to_owned),
-        artifact_key,
-        artifact_hash,
+        namespace_id: spec.namespace_id.map(ToOwned::to_owned),
+        client: spec.client.map(ToOwned::to_owned),
+        artifact_class: spec.artifact_class.map(ToOwned::to_owned),
+        artifact_key: spec.artifact_key.clone(),
+        artifact_hash: spec.artifact_hash.clone(),
         headers: metadata_to_btree(metadata),
         query: BTreeMap::new(),
         status_code,
@@ -1082,6 +1021,7 @@ fn parse_blob_resource_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{artifact::kind::ArtifactKind, test_support::test_context};
 
     #[test]
     fn parses_read_resource_names_with_and_without_instance_names() {
@@ -1125,5 +1065,95 @@ mod tests {
         let error = parse_write_resource_name("blobs/abc/10")
             .expect_err("write resources should require uploads prefix");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn action_cache_reads_emit_keyvalue_metrics() {
+        let context = test_context(|_| {}).await;
+        let service = ReapiService {
+            state: context.state.clone(),
+        };
+        let action_result = reapi::ActionResult::default();
+        let bytes = action_result.encode_to_vec();
+        let digest = reapi::Digest {
+            hash: hex::encode(Sha256::digest(&bytes)),
+            size_bytes: bytes.len() as i64,
+        };
+        let key = digest_key(&digest).expect("digest key should build");
+
+        context
+            .state
+            .store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Keyvalue,
+                DEFAULT_INSTANCE_NAME,
+                &key,
+                "application/x-protobuf",
+                &bytes,
+            )
+            .await
+            .expect("action result should persist");
+
+        service
+            .get_action_result(Request::new(reapi::GetActionResultRequest {
+                instance_name: DEFAULT_INSTANCE_NAME.into(),
+                action_digest: Some(digest),
+                digest_function: reapi::digest_function::Value::Sha256 as i32,
+                ..Default::default()
+            }))
+            .await
+            .expect("action result should load");
+
+        let rendered = context.state.metrics.render();
+        assert!(rendered.contains("kura_artifact_reads_total"));
+        assert!(rendered.contains("kind=\"keyvalue\""));
+        assert!(rendered.contains("artifact_class=\"action_cache\""));
+        assert!(rendered.contains("result=\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn cas_batch_reads_emit_module_metrics() {
+        let context = test_context(|_| {}).await;
+        let service = ReapiService {
+            state: context.state.clone(),
+        };
+        let bytes = b"blob-bytes";
+        let digest = reapi::Digest {
+            hash: hex::encode(Sha256::digest(bytes)),
+            size_bytes: bytes.len() as i64,
+        };
+        let key = digest_key(&digest).expect("digest key should build");
+
+        context
+            .state
+            .store
+            .persist_artifact_from_bytes(
+                ArtifactKind::Module,
+                DEFAULT_INSTANCE_NAME,
+                &key,
+                "application/octet-stream",
+                bytes,
+            )
+            .await
+            .expect("cas blob should persist");
+
+        let response = service
+            .batch_read_blobs(Request::new(reapi::BatchReadBlobsRequest {
+                instance_name: DEFAULT_INSTANCE_NAME.into(),
+                digests: vec![digest],
+                digest_function: reapi::digest_function::Value::Sha256 as i32,
+                ..Default::default()
+            }))
+            .await
+            .expect("batch read should succeed");
+
+        assert_eq!(response.get_ref().responses.len(), 1);
+        assert_eq!(response.get_ref().responses[0].data, bytes);
+
+        let rendered = context.state.metrics.render();
+        assert!(rendered.contains("kura_artifact_reads_total"));
+        assert!(rendered.contains("kind=\"module\""));
+        assert!(rendered.contains("artifact_class=\"blob\""));
+        assert!(rendered.contains("result=\"ok\""));
     }
 }

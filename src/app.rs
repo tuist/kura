@@ -11,6 +11,7 @@ use tokio::sync::{Notify, RwLock};
 use tracing::info;
 
 use crate::{
+    analytics::Analytics,
     config::Config,
     extension::ExtensionEngine,
     http,
@@ -38,6 +39,9 @@ pub async fn run() -> Result<(), String> {
     let extension = ExtensionEngine::from_env(metrics.clone())
         .await
         .map_err(|error| format!("failed to initialize extension engine: {error}"))?;
+    let analytics =
+        Analytics::from_config(config.analytics.as_ref(), &config.node_url, metrics.clone())
+            .map_err(|error| format!("failed to initialize analytics: {error}"))?;
     let io = IoController::new(
         metrics.clone(),
         config.file_descriptor_pool_size,
@@ -60,6 +64,7 @@ pub async fn run() -> Result<(), String> {
         memory,
         metrics,
         extension,
+        analytics,
         client,
         notify,
         members,
@@ -147,10 +152,10 @@ pub async fn run() -> Result<(), String> {
         let _ = internal_handle.await;
     }
 
-    if let Some(provider) = tracer_provider {
-        if let Err(error) = provider.shutdown() {
-            eprintln!("failed to shutdown OTLP tracer provider: {error}");
-        }
+    if let Some(provider) = tracer_provider
+        && let Err(error) = provider.shutdown()
+    {
+        eprintln!("failed to shutdown OTLP tracer provider: {error}");
     }
 
     Ok(())
@@ -197,6 +202,13 @@ fn spawn_snapshot_task(state: Arc<AppState>) {
                             .metrics
                             .update_segment_generation_count(kind, generation, count);
                     }
+                    state.metrics.update_rocksdb_memory(
+                        snapshot.rocksdb_block_cache_usage_bytes,
+                        snapshot.rocksdb_block_cache_pinned_usage_bytes,
+                        snapshot.rocksdb_block_cache_capacity_bytes,
+                        snapshot.rocksdb_write_buffer_usage_bytes,
+                        snapshot.rocksdb_write_buffer_capacity_bytes,
+                    );
                     if let Some(memory) = memory {
                         state
                             .metrics

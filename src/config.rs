@@ -24,6 +24,19 @@ const KURA_MANIFEST_CACHE_MAX_BYTES: &str = "KURA_MANIFEST_CACHE_MAX_BYTES";
 const KURA_MAX_KEYVALUE_BYTES: &str = "KURA_MAX_KEYVALUE_BYTES";
 const KURA_ROCKSDB_MAX_OPEN_FILES: &str = "KURA_ROCKSDB_MAX_OPEN_FILES";
 const KURA_ROCKSDB_MAX_BACKGROUND_JOBS: &str = "KURA_ROCKSDB_MAX_BACKGROUND_JOBS";
+const KURA_ROCKSDB_BLOCK_CACHE_BYTES: &str = "KURA_ROCKSDB_BLOCK_CACHE_BYTES";
+const KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES: &str = "KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES";
+const KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES: &str = "KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES";
+const KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER: &str = "KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER";
+const KURA_ANALYTICS_SERVER_URL: &str = "KURA_ANALYTICS_SERVER_URL";
+const KURA_ANALYTICS_SIGNING_KEY: &str = "KURA_ANALYTICS_SIGNING_KEY";
+const KURA_ANALYTICS_BATCH_SIZE: &str = "KURA_ANALYTICS_BATCH_SIZE";
+const KURA_ANALYTICS_BATCH_TIMEOUT_MS: &str = "KURA_ANALYTICS_BATCH_TIMEOUT_MS";
+const KURA_ANALYTICS_QUEUE_CAPACITY: &str = "KURA_ANALYTICS_QUEUE_CAPACITY";
+const KURA_ANALYTICS_REQUEST_TIMEOUT_MS: &str = "KURA_ANALYTICS_REQUEST_TIMEOUT_MS";
+const KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: &str =
+    "KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD";
+const KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS: &str = "KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS";
 const KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const KURA_OTEL_SERVICE_NAME: &str = "KURA_OTEL_SERVICE_NAME";
 const KURA_OTEL_DEPLOYMENT_ENVIRONMENT: &str = "KURA_OTEL_DEPLOYMENT_ENVIRONMENT";
@@ -49,6 +62,11 @@ pub struct Config {
     pub max_keyvalue_bytes: usize,
     pub rocksdb_max_open_files: i32,
     pub rocksdb_max_background_jobs: i32,
+    pub rocksdb_block_cache_bytes: usize,
+    pub rocksdb_write_buffer_manager_bytes: usize,
+    pub rocksdb_write_buffer_size_bytes: usize,
+    pub rocksdb_max_write_buffer_number: i32,
+    pub analytics: Option<AnalyticsConfig>,
     pub otlp_traces_endpoint: String,
     pub otel_service_name: String,
     pub otel_deployment_environment: String,
@@ -60,6 +78,18 @@ pub struct PeerTlsConfig {
     pub ca_cert_path: PathBuf,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnalyticsConfig {
+    pub server_url: String,
+    pub signing_key: String,
+    pub batch_size: usize,
+    pub batch_timeout_ms: u64,
+    pub queue_capacity: usize,
+    pub request_timeout_ms: u64,
+    pub circuit_breaker_failure_threshold: usize,
+    pub circuit_breaker_open_ms: u64,
 }
 
 impl Config {
@@ -111,13 +141,12 @@ impl Config {
         let discovery_dns_name = lookup(KURA_DISCOVERY_DNS_NAME)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let internal_port = lookup(KURA_INTERNAL_PORT)
-            .map(|value| {
+        let internal_port =
+            optional_parsed_value(&mut lookup, KURA_INTERNAL_PORT, &mut invalid, |value| {
                 value
                     .parse::<u16>()
                     .map_err(|_| format!("{KURA_INTERNAL_PORT} must be a valid u16"))
-            })
-            .transpose()?;
+            });
         let internal_tls_ca_cert_path = lookup(KURA_INTERNAL_TLS_CA_CERT_PATH)
             .map(PathBuf::from)
             .filter(|value| !value.as_os_str().is_empty());
@@ -339,6 +368,205 @@ impl Config {
                     }
                 },
             );
+        let rocksdb_block_cache_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_ROCKSDB_BLOCK_CACHE_BYTES,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_ROCKSDB_BLOCK_CACHE_BYTES} must be a valid usize"))
+            },
+        )
+        .unwrap_or(64 * 1024 * 1024);
+        if rocksdb_block_cache_bytes == 0 {
+            invalid.push(format!(
+                "{KURA_ROCKSDB_BLOCK_CACHE_BYTES} must be greater than 0"
+            ));
+        }
+        let rocksdb_write_buffer_manager_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES,
+            &mut invalid,
+            |value| {
+                value.parse::<usize>().map_err(|_| {
+                    format!("{KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES} must be a valid usize")
+                })
+            },
+        )
+        .unwrap_or(64 * 1024 * 1024);
+        if rocksdb_write_buffer_manager_bytes == 0 {
+            invalid.push(format!(
+                "{KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES} must be greater than 0"
+            ));
+        }
+        let rocksdb_write_buffer_size_bytes = optional_parsed_value(
+            &mut lookup,
+            KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES,
+            &mut invalid,
+            |value| {
+                value.parse::<usize>().map_err(|_| {
+                    format!("{KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES} must be a valid usize")
+                })
+            },
+        )
+        .unwrap_or(16 * 1024 * 1024);
+        if rocksdb_write_buffer_size_bytes == 0 {
+            invalid.push(format!(
+                "{KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES} must be greater than 0"
+            ));
+        } else if rocksdb_write_buffer_size_bytes > rocksdb_write_buffer_manager_bytes {
+            invalid.push(format!(
+                "{KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES} must be less than or equal to {KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES}"
+            ));
+        }
+        let rocksdb_max_write_buffer_number = optional_parsed_value(
+            &mut lookup,
+            KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER,
+            &mut invalid,
+            |value| {
+                value.parse::<i32>().map_err(|_| {
+                    format!("{KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER} must be a valid i32")
+                })
+            },
+        )
+        .unwrap_or(4);
+        if rocksdb_max_write_buffer_number <= 0 {
+            invalid.push(format!(
+                "{KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER} must be greater than 0"
+            ));
+        }
+        let analytics_server_url = lookup(KURA_ANALYTICS_SERVER_URL)
+            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty());
+        let analytics_signing_key = lookup(KURA_ANALYTICS_SIGNING_KEY)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let analytics_batch_size = optional_parsed_value(
+            &mut lookup,
+            KURA_ANALYTICS_BATCH_SIZE,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_ANALYTICS_BATCH_SIZE} must be a valid usize"))
+            },
+        )
+        .unwrap_or(100);
+        if analytics_batch_size == 0 {
+            invalid.push(format!(
+                "{KURA_ANALYTICS_BATCH_SIZE} must be greater than 0"
+            ));
+        }
+        let analytics_batch_timeout_ms = optional_parsed_value(
+            &mut lookup,
+            KURA_ANALYTICS_BATCH_TIMEOUT_MS,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("{KURA_ANALYTICS_BATCH_TIMEOUT_MS} must be a valid u64"))
+            },
+        )
+        .unwrap_or(5_000);
+        if analytics_batch_timeout_ms == 0 {
+            invalid.push(format!(
+                "{KURA_ANALYTICS_BATCH_TIMEOUT_MS} must be greater than 0"
+            ));
+        }
+        let analytics_queue_capacity = optional_parsed_value(
+            &mut lookup,
+            KURA_ANALYTICS_QUEUE_CAPACITY,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{KURA_ANALYTICS_QUEUE_CAPACITY} must be a valid usize"))
+            },
+        )
+        .unwrap_or(1_000);
+        if analytics_queue_capacity == 0 {
+            invalid.push(format!(
+                "{KURA_ANALYTICS_QUEUE_CAPACITY} must be greater than 0"
+            ));
+        }
+        let analytics_request_timeout_ms = optional_parsed_value(
+            &mut lookup,
+            KURA_ANALYTICS_REQUEST_TIMEOUT_MS,
+            &mut invalid,
+            |value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("{KURA_ANALYTICS_REQUEST_TIMEOUT_MS} must be a valid u64"))
+            },
+        )
+        .unwrap_or(5_000);
+        if analytics_request_timeout_ms == 0 {
+            invalid.push(format!(
+                "{KURA_ANALYTICS_REQUEST_TIMEOUT_MS} must be greater than 0"
+            ));
+        }
+        let analytics_circuit_breaker_failure_threshold = optional_parsed_value(
+            &mut lookup,
+            KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            &mut invalid,
+            |value| {
+                value.parse::<usize>().map_err(|_| {
+                    format!(
+                        "{KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD} must be a valid usize"
+                    )
+                })
+            },
+        )
+        .unwrap_or(5);
+        if analytics_circuit_breaker_failure_threshold == 0 {
+            invalid.push(format!(
+                "{KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD} must be greater than 0"
+            ));
+        }
+        let analytics_circuit_breaker_open_ms = optional_parsed_value(
+            &mut lookup,
+            KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS,
+            &mut invalid,
+            |value| {
+                value.parse::<u64>().map_err(|_| {
+                    format!("{KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS} must be a valid u64")
+                })
+            },
+        )
+        .unwrap_or(30_000);
+        if analytics_circuit_breaker_open_ms == 0 {
+            invalid.push(format!(
+                "{KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS} must be greater than 0"
+            ));
+        }
+        let analytics = match (analytics_server_url, analytics_signing_key) {
+            (None, None) => None,
+            (Some(server_url), Some(signing_key)) => match reqwest::Url::parse(&server_url) {
+                Ok(_) => Some(AnalyticsConfig {
+                    server_url,
+                    signing_key,
+                    batch_size: analytics_batch_size,
+                    batch_timeout_ms: analytics_batch_timeout_ms,
+                    queue_capacity: analytics_queue_capacity,
+                    request_timeout_ms: analytics_request_timeout_ms,
+                    circuit_breaker_failure_threshold: analytics_circuit_breaker_failure_threshold,
+                    circuit_breaker_open_ms: analytics_circuit_breaker_open_ms,
+                }),
+                Err(error) => {
+                    invalid.push(format!(
+                        "{KURA_ANALYTICS_SERVER_URL} must be a valid URL: {error}"
+                    ));
+                    None
+                }
+            },
+            _ => {
+                invalid.push(format!(
+                    "{KURA_ANALYTICS_SERVER_URL} and {KURA_ANALYTICS_SIGNING_KEY} must either both be set or both be unset"
+                ));
+                None
+            }
+        };
         let otlp_traces_endpoint = required_value(
             &mut lookup,
             KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
@@ -351,12 +579,12 @@ impl Config {
         if let (Some(node_url), Some(peers), Some(peer_tls)) =
             (node_url.as_ref(), peers.as_ref(), peer_tls.as_ref())
         {
-            if let Some(port) = port {
-                if peer_tls.internal_port == port {
-                    invalid.push(format!(
-                        "{KURA_INTERNAL_PORT} must differ from {KURA_PORT} when peer mTLS is enabled"
-                    ));
-                }
+            if let Some(port) = port
+                && peer_tls.internal_port == port
+            {
+                invalid.push(format!(
+                    "{KURA_INTERNAL_PORT} must differ from {KURA_PORT} when peer mTLS is enabled"
+                ));
             }
             match reqwest::Url::parse(node_url) {
                 Ok(url) => {
@@ -431,6 +659,11 @@ impl Config {
             rocksdb_max_background_jobs: rocksdb_max_background_jobs.expect(
                 "rocksdb_max_background_jobs should be present when configuration is valid",
             ),
+            rocksdb_block_cache_bytes,
+            rocksdb_write_buffer_manager_bytes,
+            rocksdb_write_buffer_size_bytes,
+            rocksdb_max_write_buffer_number,
+            analytics,
             otlp_traces_endpoint: otlp_traces_endpoint
                 .expect("otlp_traces_endpoint should be present when configuration is valid"),
             otel_service_name: otel_service_name
@@ -464,6 +697,26 @@ where
         Some(value) => Some(value),
         None => {
             missing.push(key);
+            None
+        }
+    }
+}
+
+fn optional_parsed_value<T, F, P>(
+    lookup: &mut F,
+    key: &'static str,
+    invalid: &mut Vec<String>,
+    parse: P,
+) -> Option<T>
+where
+    F: FnMut(&str) -> Option<String>,
+    P: FnOnce(&str) -> Result<T, String>,
+{
+    let value = lookup(key)?;
+    match parse(&value) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            invalid.push(error);
             None
         }
     }
@@ -566,6 +819,11 @@ mod tests {
         assert_eq!(config.max_keyvalue_bytes, 1_048_576);
         assert_eq!(config.rocksdb_max_open_files, 1024);
         assert_eq!(config.rocksdb_max_background_jobs, 4);
+        assert_eq!(config.rocksdb_block_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.rocksdb_write_buffer_manager_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.rocksdb_write_buffer_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.rocksdb_max_write_buffer_number, 4);
+        assert_eq!(config.analytics, None);
         assert_eq!(
             config.otlp_traces_endpoint,
             "https://otel.example.com/v1/traces"
@@ -594,6 +852,10 @@ mod tests {
             (KURA_MAX_KEYVALUE_BYTES, "invalid"),
             (KURA_ROCKSDB_MAX_OPEN_FILES, "invalid"),
             (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "invalid"),
+            (KURA_ROCKSDB_BLOCK_CACHE_BYTES, "invalid"),
+            (KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES, "invalid"),
+            (KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES, "invalid"),
+            (KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER, "invalid"),
             (
                 KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
                 "https://otel.example.com/v1/traces",
@@ -615,6 +877,10 @@ mod tests {
         assert!(error.contains(KURA_MAX_KEYVALUE_BYTES));
         assert!(error.contains(KURA_ROCKSDB_MAX_OPEN_FILES));
         assert!(error.contains(KURA_ROCKSDB_MAX_BACKGROUND_JOBS));
+        assert!(error.contains(KURA_ROCKSDB_BLOCK_CACHE_BYTES));
+        assert!(error.contains(KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES));
+        assert!(error.contains(KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES));
+        assert!(error.contains(KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER));
     }
 
     #[test]
@@ -651,6 +917,100 @@ mod tests {
             config.discovery_dns_name.as_deref(),
             Some("kura-ring.internal")
         );
+    }
+
+    #[test]
+    fn from_lookup_parses_optional_analytics_config() {
+        let config = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com"),
+            (KURA_PEERS, "https://kura-a.example.com"),
+            (KURA_FILE_DESCRIPTOR_POOL_SIZE, "64"),
+            (KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS, "5000"),
+            (KURA_SEGMENT_HANDLE_CACHE_SIZE, "16"),
+            (KURA_MEMORY_SOFT_LIMIT_BYTES, "268435456"),
+            (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
+            (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
+            (KURA_MAX_KEYVALUE_BYTES, "1048576"),
+            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
+            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_ROCKSDB_BLOCK_CACHE_BYTES, "33554432"),
+            (KURA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES, "50331648"),
+            (KURA_ROCKSDB_WRITE_BUFFER_SIZE_BYTES, "8388608"),
+            (KURA_ROCKSDB_MAX_WRITE_BUFFER_NUMBER, "6"),
+            (KURA_ANALYTICS_SERVER_URL, "https://tuist.dev/"),
+            (KURA_ANALYTICS_SIGNING_KEY, "secret-key"),
+            (KURA_ANALYTICS_BATCH_SIZE, "25"),
+            (KURA_ANALYTICS_BATCH_TIMEOUT_MS, "1500"),
+            (KURA_ANALYTICS_QUEUE_CAPACITY, "250"),
+            (KURA_ANALYTICS_REQUEST_TIMEOUT_MS, "3000"),
+            (KURA_ANALYTICS_CIRCUIT_BREAKER_FAILURE_THRESHOLD, "3"),
+            (KURA_ANALYTICS_CIRCUIT_BREAKER_OPEN_MS, "45000"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect("expected analytics config to parse");
+
+        assert_eq!(
+            config.analytics,
+            Some(AnalyticsConfig {
+                server_url: "https://tuist.dev".into(),
+                signing_key: "secret-key".into(),
+                batch_size: 25,
+                batch_timeout_ms: 1_500,
+                queue_capacity: 250,
+                request_timeout_ms: 3_000,
+                circuit_breaker_failure_threshold: 3,
+                circuit_breaker_open_ms: 45_000,
+            })
+        );
+        assert_eq!(config.rocksdb_block_cache_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.rocksdb_write_buffer_manager_bytes, 48 * 1024 * 1024);
+        assert_eq!(config.rocksdb_write_buffer_size_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.rocksdb_max_write_buffer_number, 6);
+    }
+
+    #[test]
+    fn from_lookup_requires_complete_analytics_config() {
+        let error = config_from(&[
+            (KURA_PORT, "4500"),
+            (KURA_GRPC_PORT, "5500"),
+            (KURA_TENANT_ID, "acme"),
+            (KURA_REGION, "eu_west"),
+            (KURA_TMP_DIR, "/tmp/kura"),
+            (KURA_DATA_DIR, "/tmp/kura-data"),
+            (KURA_NODE_URL, "https://kura.example.com"),
+            (KURA_PEERS, "https://kura-a.example.com"),
+            (KURA_FILE_DESCRIPTOR_POOL_SIZE, "64"),
+            (KURA_FILE_DESCRIPTOR_ACQUIRE_TIMEOUT_MS, "5000"),
+            (KURA_SEGMENT_HANDLE_CACHE_SIZE, "16"),
+            (KURA_MEMORY_SOFT_LIMIT_BYTES, "268435456"),
+            (KURA_MEMORY_HARD_LIMIT_BYTES, "536870912"),
+            (KURA_MANIFEST_CACHE_MAX_BYTES, "16777216"),
+            (KURA_MAX_KEYVALUE_BYTES, "1048576"),
+            (KURA_ROCKSDB_MAX_OPEN_FILES, "1024"),
+            (KURA_ROCKSDB_MAX_BACKGROUND_JOBS, "4"),
+            (KURA_ANALYTICS_SERVER_URL, "https://tuist.dev"),
+            (
+                KURA_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                "https://otel.example.com/v1/traces",
+            ),
+            (KURA_OTEL_SERVICE_NAME, "kura-eu"),
+            (KURA_OTEL_DEPLOYMENT_ENVIRONMENT, "staging"),
+        ])
+        .expect_err("expected partial analytics config to fail");
+
+        assert!(error.contains(KURA_ANALYTICS_SERVER_URL));
+        assert!(error.contains(KURA_ANALYTICS_SIGNING_KEY));
     }
 
     #[test]

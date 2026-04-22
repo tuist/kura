@@ -8,7 +8,8 @@ use std::{
 use bytes::Bytes;
 use futures_util::stream;
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options,
+    WriteBatch, WriteBufferManager, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -53,6 +54,9 @@ pub struct Store {
     tenant_id: String,
     tmp_dir: PathBuf,
     data_dir: PathBuf,
+    rocksdb_block_cache_capacity_bytes: usize,
+    rocksdb_block_cache: Cache,
+    rocksdb_write_buffer_manager: WriteBufferManager,
     segment_write_lock: Mutex<()>,
     segment_refresh_lock: Mutex<()>,
     segment_handles: Mutex<SegmentHandleCache>,
@@ -63,6 +67,11 @@ pub struct StoreSnapshot {
     pub outbox_messages: usize,
     pub multipart_uploads: usize,
     pub segment_counts: Vec<(ArtifactKind, &'static str, usize)>,
+    pub rocksdb_block_cache_usage_bytes: u64,
+    pub rocksdb_block_cache_pinned_usage_bytes: u64,
+    pub rocksdb_block_cache_capacity_bytes: u64,
+    pub rocksdb_write_buffer_usage_bytes: u64,
+    pub rocksdb_write_buffer_capacity_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +92,16 @@ pub struct NamespaceTombstonePage {
     pub next_after: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct PersistArtifactSpec<'a> {
+    kind: ArtifactKind,
+    namespace_id: &'a str,
+    key: &'a str,
+    content_type: &'a str,
+    version_ms: u64,
+    replication_targets: &'a [String],
+}
+
 impl Store {
     pub fn open(
         config: &Config,
@@ -90,6 +109,12 @@ impl Store {
         memory: MemoryController,
     ) -> Result<Self, String> {
         let rebuild_started = std::time::Instant::now();
+        let rocksdb_block_cache = Cache::new_lru_cache(config.rocksdb_block_cache_bytes);
+        let rocksdb_write_buffer_manager = WriteBufferManager::new_write_buffer_manager_with_cache(
+            config.rocksdb_write_buffer_manager_bytes,
+            true,
+            rocksdb_block_cache.clone(),
+        );
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -98,16 +123,73 @@ impl Store {
         options.set_max_background_jobs(config.rocksdb_max_background_jobs);
         options.set_bytes_per_sync(ROCKSDB_BYTES_PER_SYNC);
         options.set_wal_bytes_per_sync(ROCKSDB_WAL_BYTES_PER_SYNC);
+        options.set_write_buffer_manager(&rocksdb_write_buffer_manager);
 
         let cfs = vec![
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_MANIFESTS, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_KEYVALUE, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_NAMESPACE_ARTIFACTS, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_NAMESPACE_TOMBSTONES, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_MULTIPART_UPLOADS, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_OUTBOX, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_SEGMENT_ARTIFACTS, Options::default()),
-            ColumnFamilyDescriptor::new(ROCKSDB_CF_SEGMENT_STATE, Options::default()),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_MANIFESTS,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_KEYVALUE,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_NAMESPACE_ARTIFACTS,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_NAMESPACE_TOMBSTONES,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_MULTIPART_UPLOADS,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_OUTBOX,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_SEGMENT_ARTIFACTS,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
+            ColumnFamilyDescriptor::new(
+                ROCKSDB_CF_SEGMENT_STATE,
+                rocksdb_column_family_options(
+                    config,
+                    &rocksdb_block_cache,
+                    &rocksdb_write_buffer_manager,
+                ),
+            ),
         ];
 
         let db_path = config.data_dir.join("rocksdb");
@@ -122,6 +204,13 @@ impl Store {
         io.metrics()
             .update_segment_handle_cache_capacity(config.segment_handle_cache_size);
         io.metrics().update_segment_handles_cached(0);
+        io.metrics().update_rocksdb_memory(
+            rocksdb_block_cache.get_usage() as u64,
+            rocksdb_block_cache.get_pinned_usage() as u64,
+            config.rocksdb_block_cache_bytes as u64,
+            rocksdb_write_buffer_manager.get_usage() as u64,
+            rocksdb_write_buffer_manager.get_buffer_size() as u64,
+        );
 
         Ok(Self {
             db,
@@ -130,6 +219,9 @@ impl Store {
             tenant_id: config.tenant_id.clone(),
             tmp_dir: config.tmp_dir.clone(),
             data_dir: config.data_dir.clone(),
+            rocksdb_block_cache_capacity_bytes: config.rocksdb_block_cache_bytes,
+            rocksdb_block_cache,
+            rocksdb_write_buffer_manager,
             segment_write_lock: Mutex::new(()),
             segment_refresh_lock: Mutex::new(()),
             segment_handles: Mutex::new(SegmentHandleCache::new(config.segment_handle_cache_size)),
@@ -189,16 +281,15 @@ impl Store {
         source_path: &Path,
         replication_targets: &[String],
     ) -> Result<ArtifactManifest, String> {
-        let version_ms = now_ms();
-        self.persist_artifact_from_path_with_version(
+        let spec = PersistArtifactSpec {
             kind,
             namespace_id,
             key,
             content_type,
-            source_path,
-            version_ms,
+            version_ms: now_ms(),
             replication_targets,
-        )
+        };
+        self.persist_artifact_from_path_with_version(spec, source_path)
         .await?
         .ok_or_else(|| {
             format!(
@@ -216,68 +307,64 @@ impl Store {
         source_path: &Path,
         version_ms: u64,
     ) -> Result<bool, String> {
+        let spec = PersistArtifactSpec {
+            kind,
+            namespace_id,
+            key,
+            content_type,
+            version_ms,
+            replication_targets: &[],
+        };
         Ok(self
-            .persist_artifact_from_path_with_version(
-                kind,
-                namespace_id,
-                key,
-                content_type,
-                source_path,
-                version_ms,
-                &[],
-            )
+            .persist_artifact_from_path_with_version(spec, source_path)
             .await?
             .is_some())
     }
 
     async fn persist_artifact_from_path_with_version(
         &self,
-        kind: ArtifactKind,
-        namespace_id: &str,
-        key: &str,
-        content_type: &str,
+        spec: PersistArtifactSpec<'_>,
         source_path: &Path,
-        version_ms: u64,
-        replication_targets: &[String],
     ) -> Result<Option<ArtifactManifest>, String> {
-        if kind == ArtifactKind::Keyvalue {
+        if spec.kind == ArtifactKind::Keyvalue {
             let bytes = self.io.read(source_path).await?;
             self.io.remove_file_if_exists(source_path).await;
             return self
                 .persist_keyvalue_artifact_with_version(
-                    namespace_id,
-                    key,
-                    content_type,
+                    spec.namespace_id,
+                    spec.key,
+                    spec.content_type,
                     &bytes,
-                    version_ms,
-                    replication_targets,
+                    spec.version_ms,
+                    spec.replication_targets,
                 )
                 .await;
         }
 
-        let artifact_id = artifact_storage_id(kind, &self.tenant_id, namespace_id, key);
+        let artifact_id =
+            artifact_storage_id(spec.kind, &self.tenant_id, spec.namespace_id, spec.key);
         let size = self.io.metadata_len(source_path).await?;
 
         let existing = self.manifest_from_db(&artifact_id)?;
-        if let Some(existing) = &existing {
-            if self.storage_exists(&existing).await? {
-                if manifest_version_ms(existing) >= version_ms || version_ms == 0 {
-                    self.io.remove_file_if_exists(source_path).await;
-                    return Ok(Some(existing.clone()));
-                }
-            }
+        if let Some(existing) = &existing
+            && self.storage_exists(existing).await?
+            && (manifest_version_ms(existing) >= spec.version_ms || spec.version_ms == 0)
+        {
+            self.io.remove_file_if_exists(source_path).await;
+            return Ok(Some(existing.clone()));
         }
-        if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
+        if self.namespace_tombstone_blocks(spec.namespace_id, spec.version_ms)? {
             self.io.remove_file_if_exists(source_path).await;
             return Ok(None);
         }
 
-        let persisted_version_ms = persisted_version_ms(version_ms);
-        let (blob_path, segment_id, segment_offset, evicted_segments) = if kind
+        let persisted_version_ms = persisted_version_ms(spec.version_ms);
+        let (blob_path, segment_id, segment_offset, evicted_segments) = if spec
+            .kind
             .uses_segment_storage()
         {
             let (location, evicted_segments) =
-                self.append_to_segment(kind, source_path, size).await?;
+                self.append_to_segment(spec.kind, source_path, size).await?;
             (
                 None,
                 Some(location.segment_id),
@@ -285,7 +372,7 @@ impl Store {
                 evicted_segments,
             )
         } else {
-            let destination = blob_path(&self.data_dir, kind, &artifact_id);
+            let destination = blob_path(&self.data_dir, spec.kind, &artifact_id);
             let parent = destination
                 .parent()
                 .ok_or_else(|| "missing blob parent directory".to_string())?;
@@ -313,12 +400,12 @@ impl Store {
 
         let manifest = ArtifactManifest {
             artifact_id: artifact_id.clone(),
-            kind,
-            client: kind.client(),
-            artifact_class: kind.artifact_class(),
-            namespace_id: namespace_id.to_owned(),
-            key: key.to_owned(),
-            content_type: content_type.to_owned(),
+            kind: spec.kind,
+            client: spec.kind.client(),
+            artifact_class: spec.kind.artifact_class(),
+            namespace_id: spec.namespace_id.to_owned(),
+            key: spec.key.to_owned(),
+            content_type: spec.content_type.to_owned(),
             blob_path,
             segment_id,
             segment_offset,
@@ -340,30 +427,28 @@ impl Store {
             namespace_artifact_index_key(&metadata.namespace_id, &artifact_id).as_bytes(),
             [],
         );
-        if let Some(previous_manifest) = &existing {
-            if let Some(previous_segment_id) = &previous_manifest.segment_id {
-                if manifest.segment_id.as_deref() != Some(previous_segment_id.as_str()) {
-                    batch.delete_cf(
-                        self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
-                        segment_artifact_index_key(kind, previous_segment_id, &artifact_id)
-                            .as_bytes(),
-                    );
-                }
-            }
+        if let Some(previous_manifest) = &existing
+            && let Some(previous_segment_id) = &previous_manifest.segment_id
+            && manifest.segment_id.as_deref() != Some(previous_segment_id.as_str())
+        {
+            batch.delete_cf(
+                self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
+                segment_artifact_index_key(spec.kind, previous_segment_id, &artifact_id).as_bytes(),
+            );
         }
         if let Some(segment_id) = &manifest.segment_id {
             batch.put_cf(
                 self.cf(ROCKSDB_CF_SEGMENT_ARTIFACTS),
-                segment_artifact_index_key(kind, segment_id, &artifact_id).as_bytes(),
+                segment_artifact_index_key(spec.kind, segment_id, &artifact_id).as_bytes(),
                 [],
             );
         }
-        self.append_artifact_replication_messages(&mut batch, &manifest, replication_targets)?;
+        self.append_artifact_replication_messages(&mut batch, &manifest, spec.replication_targets)?;
 
         self.write_batch_sync(batch, "manifest batch")?;
         self.maybe_cache_manifest(manifest.clone());
 
-        self.evict_segments(kind, evicted_segments).await?;
+        self.evict_segments(spec.kind, evicted_segments).await?;
 
         Ok(Some(manifest))
     }
@@ -409,15 +494,14 @@ impl Store {
         let readable_bytes = manifest.size.saturating_sub(read_offset);
         let limit = read_limit.unwrap_or(readable_bytes).min(readable_bytes);
 
-        if manifest.kind == ArtifactKind::Keyvalue {
-            if let Some(bytes) = self.keyvalue_bytes(&manifest.artifact_id)? {
-                let start = read_offset as usize;
-                let end = start.saturating_add(limit as usize).min(bytes.len());
-                let stream = stream::once(async move {
-                    Ok::<Bytes, std::io::Error>(Bytes::from(bytes[start..end].to_vec()))
-                });
-                return Ok(Box::pin(StreamReader::new(stream)));
-            }
+        if manifest.kind == ArtifactKind::Keyvalue
+            && let Some(bytes) = self.keyvalue_bytes(&manifest.artifact_id)?
+        {
+            let start = read_offset as usize;
+            let end = start.saturating_add(limit as usize).min(bytes.len());
+            let chunk = Bytes::from(bytes).slice(start..end);
+            let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(chunk) });
+            return Ok(Box::pin(StreamReader::new(stream)));
         }
 
         if let Some(segment_id) = &manifest.segment_id {
@@ -524,10 +608,10 @@ impl Store {
     }
 
     async fn storage_exists(&self, manifest: &ArtifactManifest) -> Result<bool, String> {
-        if manifest.kind == ArtifactKind::Keyvalue {
-            if self.keyvalue_bytes(&manifest.artifact_id)?.is_some() {
-                return Ok(true);
-            }
+        if manifest.kind == ArtifactKind::Keyvalue
+            && self.keyvalue_bytes(&manifest.artifact_id)?.is_some()
+        {
+            return Ok(true);
         }
         if manifest.is_segment_backed() {
             let segment_id = manifest
@@ -558,15 +642,13 @@ impl Store {
             artifact_storage_id(ArtifactKind::Keyvalue, &self.tenant_id, namespace_id, key);
 
         let existing = self.manifest_from_db(&artifact_id)?;
-        if let Some(existing) = &existing {
-            if existing.kind == ArtifactKind::Keyvalue
-                && self.keyvalue_bytes(&artifact_id)?.is_some()
-                && existing.blob_path.is_none()
-            {
-                if manifest_version_ms(existing) >= version_ms || version_ms == 0 {
-                    return Ok(Some(existing.clone()));
-                }
-            }
+        if let Some(existing) = &existing
+            && existing.kind == ArtifactKind::Keyvalue
+            && self.keyvalue_bytes(&artifact_id)?.is_some()
+            && existing.blob_path.is_none()
+            && (manifest_version_ms(existing) >= version_ms || version_ms == 0)
+        {
+            return Ok(Some(existing.clone()));
         }
         if self.namespace_tombstone_blocks(namespace_id, version_ms)? {
             return Ok(None);
@@ -900,16 +982,15 @@ impl Store {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<ArtifactManifest, String> {
-        let version_ms = now_ms();
-        self.persist_artifact_from_bytes_with_version(
+        let spec = PersistArtifactSpec {
             kind,
             namespace_id,
             key,
             content_type,
-            bytes,
-            version_ms,
-            &[],
-        )
+            version_ms: now_ms(),
+            replication_targets: &[],
+        };
+        self.persist_artifact_from_bytes_with_version(spec, bytes)
         .await?
         .ok_or_else(|| {
             format!(
@@ -927,16 +1008,15 @@ impl Store {
         bytes: &[u8],
         replication_targets: &[String],
     ) -> Result<ArtifactManifest, String> {
-        let version_ms = now_ms();
-        self.persist_artifact_from_bytes_with_version(
+        let spec = PersistArtifactSpec {
             kind,
             namespace_id,
             key,
             content_type,
-            bytes,
-            version_ms,
+            version_ms: now_ms(),
             replication_targets,
-        )
+        };
+        self.persist_artifact_from_bytes_with_version(spec, bytes)
         .await?
         .ok_or_else(|| {
             format!(
@@ -954,55 +1034,42 @@ impl Store {
         bytes: &[u8],
         version_ms: u64,
     ) -> Result<bool, String> {
+        let spec = PersistArtifactSpec {
+            kind,
+            namespace_id,
+            key,
+            content_type,
+            version_ms,
+            replication_targets: &[],
+        };
         Ok(self
-            .persist_artifact_from_bytes_with_version(
-                kind,
-                namespace_id,
-                key,
-                content_type,
-                bytes,
-                version_ms,
-                &[],
-            )
+            .persist_artifact_from_bytes_with_version(spec, bytes)
             .await?
             .is_some())
     }
 
     async fn persist_artifact_from_bytes_with_version(
         &self,
-        kind: ArtifactKind,
-        namespace_id: &str,
-        key: &str,
-        content_type: &str,
+        spec: PersistArtifactSpec<'_>,
         bytes: &[u8],
-        version_ms: u64,
-        replication_targets: &[String],
     ) -> Result<Option<ArtifactManifest>, String> {
-        if kind == ArtifactKind::Keyvalue {
+        if spec.kind == ArtifactKind::Keyvalue {
             return self
                 .persist_keyvalue_artifact_with_version(
-                    namespace_id,
-                    key,
-                    content_type,
+                    spec.namespace_id,
+                    spec.key,
+                    spec.content_type,
                     bytes,
-                    version_ms,
-                    replication_targets,
+                    spec.version_ms,
+                    spec.replication_targets,
                 )
                 .await;
         }
 
         let temp_path = temp_file_path(&self.tmp_dir.join("uploads"), "replication");
         self.io.write(&temp_path, bytes).await?;
-        self.persist_artifact_from_path_with_version(
-            kind,
-            namespace_id,
-            key,
-            content_type,
-            &temp_path,
-            version_ms,
-            replication_targets,
-        )
-        .await
+        self.persist_artifact_from_path_with_version(spec, &temp_path)
+            .await
     }
 
     #[cfg(test)]
@@ -1045,12 +1112,13 @@ impl Store {
         let mut removed_artifact_ids = Vec::new();
         let delete_everything = version_ms == 0;
 
+        if !delete_everything
+            && let Some(current_tombstone) = self.namespace_tombstone_version(namespace_id)?
+            && current_tombstone >= version_ms
+        {
+            return Ok(false);
+        }
         if !delete_everything {
-            if let Some(current_tombstone) = self.namespace_tombstone_version(namespace_id)? {
-                if current_tombstone >= version_ms {
-                    return Ok(false);
-                }
-            }
             batch.put_cf(
                 self.cf(ROCKSDB_CF_NAMESPACE_TOMBSTONES),
                 namespace_id.as_bytes(),
@@ -1315,23 +1383,50 @@ impl Store {
         self.write_batch_sync(batch, "outbox message")
     }
 
-    pub fn outbox_messages(&self) -> Result<Vec<(Vec<u8>, OutboxMessage)>, String> {
-        let mut messages = Vec::new();
-        let iter = self
-            .db
-            .iterator_cf(self.cf(ROCKSDB_CF_OUTBOX), IteratorMode::Start);
+    pub fn next_outbox_message(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, OutboxMessage)>, String> {
+        let iter = match after {
+            Some(after) => self.db.iterator_cf(
+                self.cf(ROCKSDB_CF_OUTBOX),
+                IteratorMode::From(after, rocksdb::Direction::Forward),
+            ),
+            None => self
+                .db
+                .iterator_cf(self.cf(ROCKSDB_CF_OUTBOX), IteratorMode::Start),
+        };
+
         for item in iter {
             let (key, value) =
                 item.map_err(|error| format!("failed to iterate outbox: {error}"))?;
+            if after.is_some_and(|cursor| key.as_ref() == cursor) {
+                continue;
+            }
             let message = serde_json::from_slice::<OutboxMessage>(&value)
                 .map_err(|error| format!("failed to decode outbox message: {error}"))?;
-            messages.push((key.to_vec(), message));
+            return Ok(Some((key.to_vec(), message)));
+        }
+        Ok(None)
+    }
+
+    pub fn outbox_message_count(&self) -> Result<usize, String> {
+        self.count_cf_entries(ROCKSDB_CF_OUTBOX)
+    }
+
+    #[cfg(test)]
+    pub fn outbox_messages(&self) -> Result<Vec<(Vec<u8>, OutboxMessage)>, String> {
+        let mut messages = Vec::new();
+        let mut after = None::<Vec<u8>>;
+        while let Some((key, message)) = self.next_outbox_message(after.as_deref())? {
+            after = Some(key.clone());
+            messages.push((key, message));
         }
         Ok(messages)
     }
 
     pub fn snapshot(&self) -> Result<StoreSnapshot, String> {
-        let outbox_messages = self.outbox_messages()?.len();
+        let outbox_messages = self.outbox_message_count()?;
         let multipart_uploads = self.count_cf_entries(ROCKSDB_CF_MULTIPART_UPLOADS)?;
         let mut segment_counts = Vec::new();
         for kind in ArtifactKind::all() {
@@ -1344,6 +1439,13 @@ impl Store {
             outbox_messages,
             multipart_uploads,
             segment_counts,
+            rocksdb_block_cache_usage_bytes: self.rocksdb_block_cache.get_usage() as u64,
+            rocksdb_block_cache_pinned_usage_bytes: self.rocksdb_block_cache.get_pinned_usage()
+                as u64,
+            rocksdb_block_cache_capacity_bytes: self.rocksdb_block_cache_capacity_bytes as u64,
+            rocksdb_write_buffer_usage_bytes: self.rocksdb_write_buffer_manager.get_usage() as u64,
+            rocksdb_write_buffer_capacity_bytes: self.rocksdb_write_buffer_manager.get_buffer_size()
+                as u64,
         })
     }
 
@@ -1562,13 +1664,22 @@ impl Store {
     }
 
     fn count_cf_entries(&self, name: &str) -> Result<usize, String> {
-        let iter = self.db.iterator_cf(self.cf(name), IteratorMode::Start);
-        let mut count = 0_usize;
-        for item in iter {
-            item.map_err(|error| format!("failed to iterate {name}: {error}"))?;
-            count += 1;
+        match self
+            .db
+            .property_int_value_cf(self.cf(name), "rocksdb.estimate-num-keys")
+        {
+            Ok(Some(count)) => Ok(count as usize),
+            Ok(None) => {
+                let iter = self.db.iterator_cf(self.cf(name), IteratorMode::Start);
+                let mut count = 0_usize;
+                for item in iter {
+                    item.map_err(|error| format!("failed to iterate {name}: {error}"))?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            Err(error) => Err(format!("failed to inspect {name} size: {error}")),
         }
-        Ok(count)
     }
 
     pub fn trim_manifest_cache_to(&self, target_bytes: usize, reason: &str) -> usize {
@@ -1802,6 +1913,25 @@ fn estimated_manifest_bytes(manifest: &ArtifactManifest) -> usize {
         + std::mem::size_of::<ArtifactManifest>()
 }
 
+fn rocksdb_column_family_options(
+    config: &Config,
+    block_cache: &Cache,
+    write_buffer_manager: &WriteBufferManager,
+) -> Options {
+    let mut options = Options::default();
+    options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    options.set_write_buffer_size(config.rocksdb_write_buffer_size_bytes);
+    options.set_max_write_buffer_number(config.rocksdb_max_write_buffer_number);
+    options.set_write_buffer_manager(write_buffer_manager);
+
+    let mut block_based = BlockBasedOptions::default();
+    block_based.set_block_cache(block_cache);
+    block_based.set_cache_index_and_filter_blocks(true);
+    block_based.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    options.set_block_based_table_factory(&block_based);
+    options
+}
+
 struct SegmentLocation {
     segment_id: String,
     offset: u64,
@@ -1961,6 +2091,11 @@ mod tests {
             max_keyvalue_bytes: 512 * 1024,
             rocksdb_max_open_files: 256,
             rocksdb_max_background_jobs: 2,
+            rocksdb_block_cache_bytes: 32 * 1024 * 1024,
+            rocksdb_write_buffer_manager_bytes: 32 * 1024 * 1024,
+            rocksdb_write_buffer_size_bytes: 8 * 1024 * 1024,
+            rocksdb_max_write_buffer_number: 4,
+            analytics: None,
             otlp_traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
             otel_service_name: "kura-test".into(),
             otel_deployment_environment: "test".into(),
@@ -2702,6 +2837,48 @@ mod tests {
                 .outbox_messages()
                 .expect("failed to read outbox messages")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_outbox_depth_without_loading_messages() {
+        let (_temp_dir, _config, store) = temp_store();
+
+        store
+            .enqueue(OutboxMessage {
+                target: "http://peer-a".into(),
+                operation: ReplicationOperation::DeleteNamespace {
+                    namespace_id: "ios".into(),
+                    version_ms: 123,
+                },
+            })
+            .expect("failed to enqueue first outbox message");
+        store
+            .enqueue(OutboxMessage {
+                target: "http://peer-b".into(),
+                operation: ReplicationOperation::DeleteNamespace {
+                    namespace_id: "android".into(),
+                    version_ms: 456,
+                },
+            })
+            .expect("failed to enqueue second outbox message");
+
+        assert_eq!(
+            store
+                .outbox_message_count()
+                .expect("outbox count should load"),
+            2
+        );
+
+        let snapshot = store.snapshot().expect("snapshot should load");
+        assert_eq!(snapshot.outbox_messages, 2);
+        assert_eq!(
+            snapshot.rocksdb_block_cache_capacity_bytes,
+            _config.rocksdb_block_cache_bytes as u64
+        );
+        assert_eq!(
+            snapshot.rocksdb_write_buffer_capacity_bytes,
+            _config.rocksdb_write_buffer_manager_bytes as u64
         );
     }
 

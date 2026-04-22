@@ -222,6 +222,21 @@ struct PageQuery {
     limit: usize,
 }
 
+#[derive(Clone, Copy)]
+struct LegacyAnalyticsContext<'a> {
+    tenant_id: &'a str,
+    namespace_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct BlobPutSpec<'a> {
+    namespace_id: &'a str,
+    key: &'a str,
+    max_bytes: u64,
+    success_status: StatusCode,
+    analytics: Option<LegacyAnalyticsContext<'a>>,
+}
+
 impl PageQuery {
     fn from_params(params: &HashMap<String, String>) -> Result<Self, String> {
         let limit = params
@@ -676,12 +691,13 @@ async fn get_keyvalue(
         ArtifactKind::Keyvalue,
         &namespace.namespace_id,
         &cas_id,
+        None,
     )
     .await
 }
 
 async fn get_nx(AxumPath(hash): AxumPath<String>, State(state): State<SharedState>) -> Response {
-    get_artifact(state, ArtifactKind::Module, NX_NAMESPACE_ID, &hash).await
+    get_artifact(state, ArtifactKind::Module, NX_NAMESPACE_ID, &hash, None).await
 }
 
 async fn put_nx(
@@ -692,11 +708,14 @@ async fn put_nx(
     put_blob_artifact(
         state,
         ArtifactKind::Module,
-        NX_NAMESPACE_ID,
-        &hash,
         request,
-        MAX_MODULE_TOTAL_BYTES,
-        StatusCode::OK,
+        BlobPutSpec {
+            namespace_id: NX_NAMESPACE_ID,
+            key: &hash,
+            max_bytes: MAX_MODULE_TOTAL_BYTES,
+            success_status: StatusCode::OK,
+            analytics: None,
+        },
     )
     .await
 }
@@ -705,7 +724,14 @@ async fn get_metro(
     AxumPath(cache_key): AxumPath<String>,
     State(state): State<SharedState>,
 ) -> Response {
-    get_artifact(state, ArtifactKind::Module, METRO_NAMESPACE_ID, &cache_key).await
+    get_artifact(
+        state,
+        ArtifactKind::Module,
+        METRO_NAMESPACE_ID,
+        &cache_key,
+        None,
+    )
+    .await
 }
 
 async fn put_metro(
@@ -716,11 +742,14 @@ async fn put_metro(
     put_blob_artifact(
         state,
         ArtifactKind::Module,
-        METRO_NAMESPACE_ID,
-        &cache_key,
         request,
-        MAX_MODULE_TOTAL_BYTES,
-        StatusCode::OK,
+        BlobPutSpec {
+            namespace_id: METRO_NAMESPACE_ID,
+            key: &cache_key,
+            max_bytes: MAX_MODULE_TOTAL_BYTES,
+            success_status: StatusCode::OK,
+            analytics: None,
+        },
     )
     .await
 }
@@ -814,7 +843,17 @@ async fn get_xcode(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
 
-    get_artifact(state, ArtifactKind::Xcode, &namespace.namespace_id, &id).await
+    get_artifact(
+        state,
+        ArtifactKind::Xcode,
+        &namespace.namespace_id,
+        &id,
+        Some(LegacyAnalyticsContext {
+            tenant_id: &namespace.tenant_id,
+            namespace_id: &namespace.namespace_id,
+        }),
+    )
+    .await
 }
 
 async fn put_xcode(
@@ -831,11 +870,17 @@ async fn put_xcode(
     put_blob_artifact(
         state,
         ArtifactKind::Xcode,
-        &namespace.namespace_id,
-        &id,
         request,
-        MAX_XCODE_BYTES,
-        StatusCode::NO_CONTENT,
+        BlobPutSpec {
+            namespace_id: &namespace.namespace_id,
+            key: &id,
+            max_bytes: MAX_XCODE_BYTES,
+            success_status: StatusCode::NO_CONTENT,
+            analytics: Some(LegacyAnalyticsContext {
+                tenant_id: &namespace.tenant_id,
+                namespace_id: &namespace.namespace_id,
+            }),
+        },
     )
     .await
 }
@@ -855,6 +900,10 @@ async fn get_gradle(
         ArtifactKind::Gradle,
         &namespace.namespace_id,
         &cache_key,
+        Some(LegacyAnalyticsContext {
+            tenant_id: &namespace.tenant_id,
+            namespace_id: &namespace.namespace_id,
+        }),
     )
     .await
 }
@@ -873,11 +922,17 @@ async fn put_gradle(
     put_blob_artifact(
         state,
         ArtifactKind::Gradle,
-        &namespace.namespace_id,
-        &cache_key,
         request,
-        MAX_GRADLE_BYTES,
-        StatusCode::CREATED,
+        BlobPutSpec {
+            namespace_id: &namespace.namespace_id,
+            key: &cache_key,
+            max_bytes: MAX_GRADLE_BYTES,
+            success_status: StatusCode::CREATED,
+            analytics: Some(LegacyAnalyticsContext {
+                tenant_id: &namespace.tenant_id,
+                namespace_id: &namespace.namespace_id,
+            }),
+        },
     )
     .await
 }
@@ -923,6 +978,7 @@ async fn get_module(
         ArtifactKind::Module,
         &query.namespace.namespace_id,
         &query.artifact_key(),
+        None,
     )
     .await
 }
@@ -1304,13 +1360,18 @@ async fn get_artifact(
     kind: ArtifactKind,
     namespace_id: &str,
     key: &str,
+    analytics: Option<LegacyAnalyticsContext<'_>>,
 ) -> Response {
     match state.store.fetch_artifact(kind, namespace_id, key).await {
         Ok(Some(manifest)) => {
             state
                 .metrics
                 .record_artifact_read(kind, "ok", manifest.size);
-            serve_file(&state, StatusCode::OK, &manifest).await
+            let response = serve_file(&state, StatusCode::OK, &manifest).await;
+            if response.status().is_success() {
+                record_legacy_cache_event(&state, kind, "download", analytics, key, manifest.size);
+            }
+            response
         }
         Ok(None) => {
             state.metrics.record_artifact_read(kind, "not_found", 0);
@@ -1329,14 +1390,15 @@ async fn get_artifact(
 async fn put_blob_artifact(
     state: SharedState,
     kind: ArtifactKind,
-    namespace_id: &str,
-    key: &str,
     request: Request,
-    max_bytes: u64,
-    success_status: StatusCode,
+    spec: BlobPutSpec<'_>,
 ) -> Response {
-    match state.store.artifact_exists(kind, namespace_id, key).await {
-        Ok(true) => return success_status.into_response(),
+    match state
+        .store
+        .artifact_exists(kind, spec.namespace_id, spec.key)
+        .await
+    {
+        Ok(true) => return spec.success_status.into_response(),
         Ok(false) => {}
         Err(error) => {
             return error_response(
@@ -1349,7 +1411,7 @@ async fn put_blob_artifact(
     let temp = match read_request_to_temp(
         request,
         &state.config.tmp_dir.join("uploads"),
-        max_bytes,
+        spec.max_bytes,
         &state.io,
     )
     .await
@@ -1374,8 +1436,8 @@ async fn put_blob_artifact(
         .store
         .persist_artifact_from_path_and_enqueue(
             kind,
-            namespace_id,
-            key,
+            spec.namespace_id,
+            spec.key,
             "application/octet-stream",
             &temp.path,
             &targets,
@@ -1387,7 +1449,15 @@ async fn put_blob_artifact(
             state
                 .metrics
                 .record_artifact_write(kind, "ok", manifest.size);
-            success_status.into_response()
+            record_legacy_cache_event(
+                &state,
+                kind,
+                "upload",
+                spec.analytics,
+                spec.key,
+                manifest.size,
+            );
+            spec.success_status.into_response()
         }
         Err(error) => {
             state.metrics.record_artifact_write(kind, "error", 0);
@@ -1396,6 +1466,38 @@ async fn put_blob_artifact(
                 format!("Failed to persist artifact: {error}"),
             )
         }
+    }
+}
+
+fn record_legacy_cache_event(
+    state: &SharedState,
+    kind: ArtifactKind,
+    action: &str,
+    analytics: Option<LegacyAnalyticsContext<'_>>,
+    key: &str,
+    size: u64,
+) {
+    let Some(context) = analytics else {
+        return;
+    };
+    let Some(analytics) = state.analytics.as_ref() else {
+        return;
+    };
+
+    match (kind, action) {
+        (ArtifactKind::Xcode, "download") => {
+            analytics.enqueue_xcode_download(context.tenant_id, context.namespace_id, key, size)
+        }
+        (ArtifactKind::Xcode, "upload") => {
+            analytics.enqueue_xcode_upload(context.tenant_id, context.namespace_id, key, size)
+        }
+        (ArtifactKind::Gradle, "download") => {
+            analytics.enqueue_gradle_download(context.tenant_id, context.namespace_id, key, size)
+        }
+        (ArtifactKind::Gradle, "upload") => {
+            analytics.enqueue_gradle_upload(context.tenant_id, context.namespace_id, key, size)
+        }
+        _ => {}
     }
 }
 
@@ -1430,12 +1532,19 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::body::Body;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Router, body::Body, extract::Request, response::IntoResponse, routing::post};
+    use http_body_util::BodyExt;
     use serde_json::Value;
+    use tokio::time::{Duration, sleep, timeout};
     use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::{response_text, test_context};
+    use crate::{
+        config::AnalyticsConfig,
+        test_support::{response_text, test_context},
+    };
 
     #[tokio::test]
     async fn up_includes_current_node_and_known_members() {
@@ -1543,6 +1652,97 @@ mod tests {
             .expect("get request failed");
         assert_eq!(get_response.status(), StatusCode::OK);
         assert_eq!(response_text(get_response).await, "xcode-binary");
+    }
+
+    #[tokio::test]
+    async fn xcode_routes_emit_legacy_analytics_events() {
+        let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+        let (base_url, _handle) = spawn_capture_server(captured.clone()).await;
+        let context = test_context(|config| {
+            config.analytics = Some(AnalyticsConfig {
+                server_url: base_url,
+                signing_key: "secret-key".into(),
+                batch_size: 1,
+                batch_timeout_ms: 5_000,
+                queue_capacity: 8,
+                request_timeout_ms: 5_000,
+                circuit_breaker_failure_threshold: 2,
+                circuit_breaker_open_ms: 5_000,
+            });
+        })
+        .await;
+        let app = router(context.state.clone());
+
+        let put_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from("xcode-binary"))
+                    .expect("failed to build put request"),
+            )
+            .await
+            .expect("put request failed");
+        assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cache/cas/artifact-1?tenant_id=acme&namespace_id=ios")
+                    .body(Body::empty())
+                    .expect("failed to build get request"),
+            )
+            .await
+            .expect("get request failed");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(response_text(get_response).await, "xcode-binary");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if captured.lock().expect("captured requests lock").len() >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("analytics requests should be delivered");
+
+        let requests = captured.lock().expect("captured requests lock");
+        let payloads = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<Value>(&request.body)
+                    .expect("analytics request body should decode")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(payloads.iter().any(|payload| {
+            payload
+                == &serde_json::json!({
+                    "events": [{
+                        "account_handle": "acme",
+                        "project_handle": "ios",
+                        "action": "upload",
+                        "size": 12,
+                        "cas_id": "artifact-1"
+                    }]
+                })
+        }));
+        assert!(payloads.iter().any(|payload| {
+            payload
+                == &serde_json::json!({
+                    "events": [{
+                        "account_handle": "acme",
+                        "project_handle": "ios",
+                        "action": "download",
+                        "size": 12,
+                        "cas_id": "artifact-1"
+                    }]
+                })
+        }));
     }
 
     #[tokio::test]
@@ -1744,5 +1944,62 @@ mod tests {
             .await
             .expect("get request failed");
         assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedRequest {
+        body: Vec<u8>,
+    }
+
+    async fn spawn_capture_server(
+        captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new()
+            .route(
+                "/webhooks/cache",
+                post({
+                    let captured = captured.clone();
+                    move |request| capture_request(captured.clone(), request)
+                }),
+            )
+            .route(
+                "/webhooks/gradle-cache",
+                post({
+                    let captured = captured.clone();
+                    move |request| capture_request(captured.clone(), request)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("capture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("capture listener should have a local address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("capture server should run");
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    async fn capture_request(
+        captured: Arc<Mutex<Vec<CapturedRequest>>>,
+        request: Request,
+    ) -> impl IntoResponse {
+        let (_parts, body) = request.into_parts();
+        let body = body
+            .collect()
+            .await
+            .expect("request body should collect")
+            .to_bytes();
+        captured
+            .lock()
+            .expect("captured requests lock")
+            .push(CapturedRequest {
+                body: body.to_vec(),
+            });
+        StatusCode::ACCEPTED
     }
 }

@@ -61,12 +61,24 @@ pub struct Metrics {
     bootstrap_runs: Family<BootstrapResultLabels, Counter>,
     bootstrap_duration: Histogram,
     bootstrap_applied_items: Family<BootstrapItemLabels, Counter>,
+    analytics_events: Family<AnalyticsLabels, Counter>,
+    analytics_batches: Family<AnalyticsLabels, Counter>,
+    analytics_batch_duration: Family<AnalyticsRouteLabels, Histogram>,
+    analytics_queue_depth: Gauge,
+    analytics_queue_capacity: Gauge,
+    analytics_circuit_state: Family<AnalyticsRouteLabels, Gauge>,
+    analytics_circuit_transitions: Family<AnalyticsCircuitTransitionLabels, Counter>,
     segment_generation_counts: Family<SegmentGenerationLabels, Gauge>,
     extension_hooks: Family<ExtensionHookLabels, Counter>,
     extension_hook_duration: Family<ExtensionHookRouteLabels, Histogram>,
     extension_cache: Family<ExtensionCacheLabels, Counter>,
     process_resident_memory_bytes: Gauge,
     process_virtual_memory_bytes: Gauge,
+    rocksdb_block_cache_usage_bytes: Gauge,
+    rocksdb_block_cache_pinned_usage_bytes: Gauge,
+    rocksdb_block_cache_capacity_bytes: Gauge,
+    rocksdb_write_buffer_usage_bytes: Gauge,
+    rocksdb_write_buffer_capacity_bytes: Gauge,
     memory_pressure_state: Gauge,
     memory_soft_limit_bytes: Gauge,
     memory_hard_limit_bytes: Gauge,
@@ -136,6 +148,17 @@ impl Metrics {
         let bootstrap_runs = Family::<BootstrapResultLabels, Counter>::default();
         let bootstrap_duration = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         let bootstrap_applied_items = Family::<BootstrapItemLabels, Counter>::default();
+        let analytics_events = Family::<AnalyticsLabels, Counter>::default();
+        let analytics_batches = Family::<AnalyticsLabels, Counter>::default();
+        let analytics_batch_duration =
+            Family::<AnalyticsRouteLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.001, 2.0, 16))
+            });
+        let analytics_queue_depth = Gauge::default();
+        let analytics_queue_capacity = Gauge::default();
+        let analytics_circuit_state = Family::<AnalyticsRouteLabels, Gauge>::default();
+        let analytics_circuit_transitions =
+            Family::<AnalyticsCircuitTransitionLabels, Counter>::default();
         let segment_generation_counts = Family::<SegmentGenerationLabels, Gauge>::default();
         let extension_hooks = Family::<ExtensionHookLabels, Counter>::default();
         let extension_hook_duration =
@@ -145,6 +168,11 @@ impl Metrics {
         let extension_cache = Family::<ExtensionCacheLabels, Counter>::default();
         let process_resident_memory_bytes = Gauge::default();
         let process_virtual_memory_bytes = Gauge::default();
+        let rocksdb_block_cache_usage_bytes = Gauge::default();
+        let rocksdb_block_cache_pinned_usage_bytes = Gauge::default();
+        let rocksdb_block_cache_capacity_bytes = Gauge::default();
+        let rocksdb_write_buffer_usage_bytes = Gauge::default();
+        let rocksdb_write_buffer_capacity_bytes = Gauge::default();
         let memory_pressure_state = Gauge::default();
         let memory_soft_limit_bytes = Gauge::default();
         let memory_hard_limit_bytes = Gauge::default();
@@ -366,6 +394,41 @@ impl Metrics {
             bootstrap_applied_items.clone(),
         );
         registry.register(
+            "kura_analytics_events_total",
+            "Analytics events by pipeline and result",
+            analytics_events.clone(),
+        );
+        registry.register(
+            "kura_analytics_batches_total",
+            "Analytics webhook batch sends by pipeline and result",
+            analytics_batches.clone(),
+        );
+        registry.register(
+            "kura_analytics_batch_duration_seconds",
+            "Analytics webhook batch latency by pipeline",
+            analytics_batch_duration.clone(),
+        );
+        registry.register(
+            "kura_analytics_queue_depth",
+            "Pending analytics events currently buffered in memory",
+            analytics_queue_depth.clone(),
+        );
+        registry.register(
+            "kura_analytics_queue_capacity",
+            "Configured capacity of the in-memory analytics queue",
+            analytics_queue_capacity.clone(),
+        );
+        registry.register(
+            "kura_analytics_circuit_state",
+            "Analytics circuit breaker state where 0=closed, 1=open, 2=half_open",
+            analytics_circuit_state.clone(),
+        );
+        registry.register(
+            "kura_analytics_circuit_transitions_total",
+            "Analytics circuit breaker transitions by pipeline",
+            analytics_circuit_transitions.clone(),
+        );
+        registry.register(
             "kura_segment_generation_count",
             "Segments currently tracked by generation and artifact kind",
             segment_generation_counts.clone(),
@@ -394,6 +457,31 @@ impl Metrics {
             "kura_process_virtual_memory_bytes",
             "Process virtual memory size in bytes",
             process_virtual_memory_bytes.clone(),
+        );
+        registry.register(
+            "kura_rocksdb_block_cache_usage_bytes",
+            "RocksDB block cache usage in bytes",
+            rocksdb_block_cache_usage_bytes.clone(),
+        );
+        registry.register(
+            "kura_rocksdb_block_cache_pinned_usage_bytes",
+            "Pinned RocksDB block cache usage in bytes",
+            rocksdb_block_cache_pinned_usage_bytes.clone(),
+        );
+        registry.register(
+            "kura_rocksdb_block_cache_capacity_bytes",
+            "Configured RocksDB block cache capacity in bytes",
+            rocksdb_block_cache_capacity_bytes.clone(),
+        );
+        registry.register(
+            "kura_rocksdb_write_buffer_usage_bytes",
+            "RocksDB write buffer manager usage in bytes",
+            rocksdb_write_buffer_usage_bytes.clone(),
+        );
+        registry.register(
+            "kura_rocksdb_write_buffer_capacity_bytes",
+            "Configured RocksDB write buffer manager capacity in bytes",
+            rocksdb_write_buffer_capacity_bytes.clone(),
         );
         registry.register(
             "kura_memory_pressure_state",
@@ -474,12 +562,24 @@ impl Metrics {
             bootstrap_runs,
             bootstrap_duration,
             bootstrap_applied_items,
+            analytics_events,
+            analytics_batches,
+            analytics_batch_duration,
+            analytics_queue_depth,
+            analytics_queue_capacity,
+            analytics_circuit_state,
+            analytics_circuit_transitions,
             segment_generation_counts,
             extension_hooks,
             extension_hook_duration,
             extension_cache,
             process_resident_memory_bytes,
             process_virtual_memory_bytes,
+            rocksdb_block_cache_usage_bytes,
+            rocksdb_block_cache_pinned_usage_bytes,
+            rocksdb_block_cache_capacity_bytes,
+            rocksdb_write_buffer_usage_bytes,
+            rocksdb_write_buffer_capacity_bytes,
             memory_pressure_state,
             memory_soft_limit_bytes,
             memory_hard_limit_bytes,
@@ -790,6 +890,55 @@ impl Metrics {
         }
     }
 
+    pub fn record_analytics_event(&self, pipeline: &str, result: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.analytics_events
+            .get_or_create(&AnalyticsLabels {
+                pipeline: pipeline.to_owned(),
+                result: result.to_owned(),
+            })
+            .inc_by(count);
+    }
+
+    pub fn record_analytics_batch(&self, pipeline: &str, result: &str, duration: Duration) {
+        self.analytics_batches
+            .get_or_create(&AnalyticsLabels {
+                pipeline: pipeline.to_owned(),
+                result: result.to_owned(),
+            })
+            .inc();
+        self.analytics_batch_duration
+            .get_or_create(&AnalyticsRouteLabels {
+                pipeline: pipeline.to_owned(),
+            })
+            .observe(duration.as_secs_f64());
+    }
+
+    pub fn update_analytics_queue(&self, capacity: usize, depth: usize) {
+        self.analytics_queue_capacity.set(capacity as i64);
+        self.analytics_queue_depth.set(depth as i64);
+    }
+
+    pub fn update_analytics_circuit_state(&self, pipeline: &str, state: i64) {
+        self.analytics_circuit_state
+            .get_or_create(&AnalyticsRouteLabels {
+                pipeline: pipeline.to_owned(),
+            })
+            .set(state);
+    }
+
+    pub fn record_analytics_circuit_transition(&self, pipeline: &str, from: &str, to: &str) {
+        self.analytics_circuit_transitions
+            .get_or_create(&AnalyticsCircuitTransitionLabels {
+                pipeline: pipeline.to_owned(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+            })
+            .inc();
+    }
+
     pub fn update_segment_generation_count(
         &self,
         kind: ArtifactKind,
@@ -831,6 +980,26 @@ impl Metrics {
         self.process_resident_memory_bytes
             .set(resident_bytes as i64);
         self.process_virtual_memory_bytes.set(virtual_bytes as i64);
+    }
+
+    pub fn update_rocksdb_memory(
+        &self,
+        block_cache_usage_bytes: u64,
+        block_cache_pinned_usage_bytes: u64,
+        block_cache_capacity_bytes: u64,
+        write_buffer_usage_bytes: u64,
+        write_buffer_capacity_bytes: u64,
+    ) {
+        self.rocksdb_block_cache_usage_bytes
+            .set(block_cache_usage_bytes as i64);
+        self.rocksdb_block_cache_pinned_usage_bytes
+            .set(block_cache_pinned_usage_bytes as i64);
+        self.rocksdb_block_cache_capacity_bytes
+            .set(block_cache_capacity_bytes as i64);
+        self.rocksdb_write_buffer_usage_bytes
+            .set(write_buffer_usage_bytes as i64);
+        self.rocksdb_write_buffer_capacity_bytes
+            .set(write_buffer_capacity_bytes as i64);
     }
 
     pub fn update_memory_pressure_state(&self, state: i64) {
@@ -1012,6 +1181,24 @@ struct BootstrapItemLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AnalyticsLabels {
+    pipeline: String,
+    result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AnalyticsRouteLabels {
+    pipeline: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AnalyticsCircuitTransitionLabels {
+    pipeline: String,
+    from: String,
+    to: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MemoryPressureTransitionLabels {
     from: String,
     to: String,
@@ -1076,8 +1263,14 @@ mod tests {
         metrics.update_multipart_uploads(2);
         metrics.update_discovered_peer_nodes(3);
         metrics.record_bootstrap_run("ok", Duration::from_millis(6), 2, 5);
+        metrics.update_analytics_queue(1000, 2);
+        metrics.record_analytics_event("xcode", "sent", 2);
+        metrics.record_analytics_batch("xcode", "ok", Duration::from_millis(7));
+        metrics.update_analytics_circuit_state("xcode", 1);
+        metrics.record_analytics_circuit_transition("xcode", "closed", "open");
         metrics.update_segment_generation_count(ArtifactKind::Xcode, "old", 1);
         metrics.update_process_memory(1024, 2048);
+        metrics.update_rocksdb_memory(256, 64, 4096, 512, 2048);
         metrics.update_memory_limits(4_096, 8_192);
         metrics.update_memory_pressure_state(1);
         metrics.record_memory_pressure_transition("normal", "constrained");
@@ -1115,8 +1308,20 @@ mod tests {
         assert!(rendered.contains("kura_bootstrap_runs_total"));
         assert!(rendered.contains("kura_bootstrap_duration_seconds"));
         assert!(rendered.contains("kura_bootstrap_applied_items_total"));
+        assert!(rendered.contains("kura_analytics_events_total"));
+        assert!(rendered.contains("kura_analytics_batches_total"));
+        assert!(rendered.contains("kura_analytics_batch_duration_seconds"));
+        assert!(rendered.contains("kura_analytics_queue_depth"));
+        assert!(rendered.contains("kura_analytics_queue_capacity"));
+        assert!(rendered.contains("kura_analytics_circuit_state"));
+        assert!(rendered.contains("kura_analytics_circuit_transitions_total"));
         assert!(rendered.contains("kura_segment_generation_count"));
         assert!(rendered.contains("kura_process_resident_memory_bytes"));
+        assert!(rendered.contains("kura_rocksdb_block_cache_usage_bytes"));
+        assert!(rendered.contains("kura_rocksdb_block_cache_pinned_usage_bytes"));
+        assert!(rendered.contains("kura_rocksdb_block_cache_capacity_bytes"));
+        assert!(rendered.contains("kura_rocksdb_write_buffer_usage_bytes"));
+        assert!(rendered.contains("kura_rocksdb_write_buffer_capacity_bytes"));
         assert!(rendered.contains("kura_memory_pressure_state"));
         assert!(rendered.contains("kura_memory_pressure_transitions_total"));
         assert!(rendered.contains("kura_background_work_paused"));

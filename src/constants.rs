@@ -7,8 +7,8 @@ pub const DESIRED_OLD_SEGMENTS: usize = 1;
 pub const DESIRED_CURRENT_SEGMENTS: usize = 2;
 pub const DESIRED_NEW_SEGMENTS: usize = 2;
 pub const REPLICATION_RETRY_SECS: u64 = 2;
-pub const ROCKSDB_BYTES_PER_SYNC: u64 = 1 * 1024 * 1024;
-pub const ROCKSDB_WAL_BYTES_PER_SYNC: u64 = 1 * 1024 * 1024;
+pub const ROCKSDB_BYTES_PER_SYNC: u64 = 1024 * 1024;
+pub const ROCKSDB_WAL_BYTES_PER_SYNC: u64 = 1024 * 1024;
 
 pub const ROCKSDB_CF_MANIFESTS: &str = "manifests";
 pub const ROCKSDB_CF_KEYVALUE: &str = "keyvalue";

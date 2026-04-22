@@ -7,8 +7,8 @@ use reqwest::Client;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::{
-    config::Config, extension::SharedExtension, io::IoController, memory::MemoryController,
-    metrics::Metrics, store::Store,
+    analytics::Analytics, config::Config, extension::SharedExtension, io::IoController,
+    memory::MemoryController, metrics::Metrics, store::Store,
 };
 
 pub struct AppState {
@@ -18,6 +18,7 @@ pub struct AppState {
     pub memory: MemoryController,
     pub metrics: Metrics,
     pub extension: Option<SharedExtension>,
+    pub analytics: Option<Analytics>,
     pub client: Client,
     pub notify: Notify,
     pub members: RwLock<BTreeSet<String>>,
