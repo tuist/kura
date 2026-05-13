@@ -133,7 +133,7 @@ services:
       - ./ops/loki/config.yml:/etc/loki/config.yml:ro
 
   promtail:
-    image: grafana/promtail:3.5.0
+    image: grafana/promtail:3.6.11
     command: ["-config.file=/etc/promtail/config.yml"]
     depends_on:
       - loki
