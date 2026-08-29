@@ -125,7 +125,7 @@ services:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
 
   loki:
-    image: grafana/loki:3.5.0
+    image: grafana/loki:3.7.7
     command: ["-config.file=/etc/loki/config.yml"]
     ports:
       - "${LOKI_PORT:-3100}:3100"
