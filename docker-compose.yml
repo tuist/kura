@@ -151,7 +151,7 @@ services:
       - ./ops/tempo/config.yml:/etc/tempo/config.yml:ro
 
   grafana:
-    image: grafana/grafana:12.1.1
+    image: grafana/grafana:12.4.10
     depends_on:
       - prometheus
       - loki
